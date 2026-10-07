@@ -1,0 +1,16 @@
+{
+  "event_name": "Cloud Computing Bootcamp",
+  "issuer_name": "ABC Academy",
+  "issue_date": "2026-10-07",
+  "recipients": [
+    {
+      "name": "Kavi",
+      "email": "kavi@example.com",
+      "achievement": "Outstanding Performance in Cloud Computing"
+    },
+    {
+      "name": "Asha Sharma",
+      "email": "asha@example.com"
+    }
+  ]
+}

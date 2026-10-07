@@ -65,6 +65,8 @@ class CertificateData:
     event_name: str
     issuer_name: str
     issue_date: date
+    # Optional; None or blank renders the certificate exactly as without it.
+    achievement: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,17 @@ FIELD_SPECS: dict[str, FieldSpec] = {
     "certificate_id": FieldSpec(SANS, 8.5, 8.5, Box(CONTENT_LEFT, 40, CONTENT_WIDTH, 16), "middle", MUTED),
 }
 
+# With an achievement, the event area gives up height for the fixed phrase
+# below it and the achievement line. Without one, FIELD_SPECS is used
+# unchanged, so those certificates look exactly as before.
+ACHIEVEMENT_PHRASE = "and is recognized for"
+ACHIEVEMENT_PHRASE_BASELINE = 205
+ACHIEVEMENT_FIELD_SPECS: dict[str, FieldSpec] = {
+    **FIELD_SPECS,
+    "event_name": FieldSpec(SERIF_BOLD, 22, 8, Box(CONTENT_LEFT, 222, CONTENT_WIDTH, 40), "middle", INK),
+    "achievement": FieldSpec(SERIF, 15, 7, Box(CONTENT_LEFT, 172, CONTENT_WIDTH, 28), "middle", NAVY),
+}
+
 
 def render_certificate(data: CertificateData) -> bytes:
     """Render one certificate and return the PDF bytes."""
@@ -142,7 +155,7 @@ def render_certificate(data: CertificateData) -> bytes:
     canvas.setSubject(data.event_name)
     canvas.setCreator("Bulk Certificate Generator")
 
-    _draw_template(canvas)
+    _draw_template(canvas, with_achievement=any(block.field == "achievement" for block in blocks))
     for block in blocks:
         _draw_block(canvas, block)
 
@@ -154,6 +167,8 @@ def render_certificate(data: CertificateData) -> bytes:
 def layout_certificate(data: CertificateData) -> list[TextBlock]:
     """Fit every variable text into its area. Raises CertificateRenderError subclasses."""
     register_fonts()
+    achievement = text_policy.normalize(data.achievement) if data.achievement else ""
+    specs = ACHIEVEMENT_FIELD_SPECS if achievement else FIELD_SPECS
     texts = {
         "recipient_name": data.recipient_name,
         "event_name": data.event_name,
@@ -161,9 +176,11 @@ def layout_certificate(data: CertificateData) -> list[TextBlock]:
         "issue_date": format_issue_date(data.issue_date),
         "certificate_id": f"Certificate ID: {data.certificate_id}",
     }
+    if achievement:
+        texts["achievement"] = achievement
     blocks = []
     for field, text in texts.items():
-        spec = FIELD_SPECS[field]
+        spec = specs[field]
         blocks.append(fit_text(field, prepare_text(field, text, spec.font_name), spec))
     return blocks
 
@@ -256,7 +273,7 @@ def _draw_block(canvas: Canvas, block: TextBlock) -> None:
         canvas.drawCentredString(center_x, baseline, line)
 
 
-def _draw_template(canvas: Canvas) -> None:
+def _draw_template(canvas: Canvas, with_achievement: bool = False) -> None:
     """The fixed parts of the certificate."""
     canvas.setStrokeColor(NAVY)
     canvas.setLineWidth(2.5)
@@ -280,6 +297,9 @@ def _draw_template(canvas: Canvas) -> None:
     canvas.setFont(SERIF, 15)
     canvas.drawCentredString(PAGE_WIDTH / 2, 411, "This is to certify that")
     canvas.drawCentredString(PAGE_WIDTH / 2, 272, "has participated in")
+    if with_achievement:
+        canvas.setFont(SERIF, 13)
+        canvas.drawCentredString(PAGE_WIDTH / 2, ACHIEVEMENT_PHRASE_BASELINE, ACHIEVEMENT_PHRASE)
 
     for field, label in (("issuer_name", "Issued by"), ("issue_date", "Date of issue")):
         box = FIELD_SPECS[field].box

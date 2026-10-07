@@ -116,7 +116,7 @@ List per-recipient results (paginated; `limit` 1–200, default 50):
 curl "http://localhost:8000/api/v1/jobs/JOB_ID/recipients?limit=50&offset=0"
 ```
 
-Each item has `recipient_id`, `input_index`, `status`, `name`, `email`,
+Each item has `recipient_id`, `input_index`, `status`, `name`, `email`, `achievement`,
 `errors` (for `INVALID` / `FAILED`), and `download_url` (for `SUCCESS`).
 
 Download one certificate (the `recipient_id` is the certificate ID):
@@ -131,6 +131,7 @@ Other sample requests in [examples/](examples/):
 |---|---|
 | `job-request.json` | `202`; 2 certificates, 1 `INVALID` entry |
 | `job-request-all-valid.json` | `202`; 4 certificates, including accented and Cyrillic names |
+| `job-request-with-achievement.json` | `202`; 2 certificates, one with the optional `achievement` line |
 | `job-request-all-invalid.json` | `422 all_recipients_invalid` with indexed errors; no job created |
 | `job-request-invalid-shared.json` | `422` (empty event name, non-ISO date); no job created |
 
@@ -161,6 +162,7 @@ and Swagger UI.
 | `recipients` | required list of 1–1,000 entries (application limit, `MAX_RECIPIENTS_PER_JOB`) |
 | recipient `name` | required; trimmed and NFC-normalized; 1–150 characters; supported characters only |
 | recipient `email` | optional or `null`; syntax checked when given (no DNS lookup) |
+| recipient `achievement` | optional; omitted, `null`, or blank means none; otherwise trimmed and NFC-normalized, up to 150 characters, supported characters only; printed below the event name as "and is recognized for …" |
 | duplicates | allowed; each entry gets its own certificate |
 
 Invalid shared fields reject the request (`422`, nothing saved). Each

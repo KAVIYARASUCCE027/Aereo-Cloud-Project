@@ -22,6 +22,7 @@ class ValidRecipient:
     input_index: int
     name: str
     email: str | None
+    achievement: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,14 @@ def validate_recipients(entries: Sequence[Any]) -> RecipientValidationResult:
         except ValidationError as exc:
             invalid.append(InvalidRecipient(input_index=input_index, errors=error_details(exc)))
         else:
-            valid.append(ValidRecipient(input_index=input_index, name=recipient.name, email=recipient.email))
+            valid.append(
+                ValidRecipient(
+                    input_index=input_index,
+                    name=recipient.name,
+                    email=recipient.email,
+                    achievement=recipient.achievement,
+                )
+            )
 
     return RecipientValidationResult(valid=valid, invalid=invalid)
 

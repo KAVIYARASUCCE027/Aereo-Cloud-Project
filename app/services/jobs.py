@@ -80,6 +80,7 @@ def create_job(session: Session, request: JobCreateRequest) -> CreatedJob:
             input_index=recipient.input_index,
             name=recipient.name,
             email=recipient.email,
+            achievement=recipient.achievement,
             status=RecipientStatus.PENDING,
         )
         for recipient in validation.valid

@@ -157,6 +157,7 @@ def get_job_recipients(
                 status=row.status,
                 name=row.name,
                 email=row.email,
+                achievement=row.achievement,
                 errors=row.error_details,
                 download_url=certificate_download_url(row.id) if row.status is RecipientStatus.SUCCESS else None,
                 started_at=row.started_at,

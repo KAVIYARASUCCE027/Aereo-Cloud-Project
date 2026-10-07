@@ -136,6 +136,7 @@ class JobRecipient(Base):
             " OR (status <> 'INVALID' AND name IS NOT NULL)",
             name="name_matches_status",
         ),
+        CheckConstraint("status <> 'INVALID' OR achievement IS NULL", name="invalid_has_no_achievement"),
         CheckConstraint(
             "status <> 'INVALID' OR error_details IS NOT NULL",
             name="invalid_has_error_details",
@@ -163,6 +164,8 @@ class JobRecipient(Base):
     input_index: Mapped[int] = mapped_column(Integer)
     name: Mapped[str | None] = mapped_column(String(150))
     email: Mapped[str | None] = mapped_column(String(320))
+    # Optional validated text printed on the certificate; NULL when not given.
+    achievement: Mapped[str | None] = mapped_column(String(150))
     status: Mapped[RecipientStatus] = mapped_column(_status_type(RecipientStatus))
     # List of {"field", "code", "message"} objects for INVALID and FAILED rows.
     # none_as_null: Python None is stored as SQL NULL, not as the JSON value null,

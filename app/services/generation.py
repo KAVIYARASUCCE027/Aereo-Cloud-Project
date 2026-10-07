@@ -33,7 +33,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Update, func, select, update
+from sqlalchemy import Row, Update, func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_settings
@@ -54,6 +54,7 @@ _REQUEST_FIELDS = {
     "event_name": "event_name",
     "issuer_name": "issuer_name",
     "issue_date": "issue_date",
+    "achievement": "achievement",
 }
 
 
@@ -179,18 +180,19 @@ def _pending_recipient_ids(job_id: uuid.UUID) -> list[uuid.UUID]:
 
 
 def _process_recipient(job: ClaimedJob, recipient_id: uuid.UUID, root: Path) -> None:
-    name = _start_recipient(recipient_id)
-    if name is None:
+    recipient = _start_recipient(recipient_id)
+    if recipient is None:
         return  # no longer PENDING, so another execution handled it; skip
 
     # The recipient's own ID is the certificate ID, so every attempt for this
     # recipient produces the same certificate ID and the same file name.
     data = CertificateData(
         certificate_id=recipient_id,
-        recipient_name=name,
+        recipient_name=recipient.name,
         event_name=job.event_name,
         issuer_name=job.issuer_name,
         issue_date=job.issue_date,
+        achievement=recipient.achievement,
     )
     outcome = _generate_certificate(job.job_id, data, root)
 
@@ -202,15 +204,19 @@ def _process_recipient(job: ClaimedJob, recipient_id: uuid.UUID, root: Path) -> 
         _finish_recipient(job.job_id, recipient_id, RecipientStatus.SUCCESS, storage_key=outcome)
 
 
-def _start_recipient(recipient_id: uuid.UUID) -> str | None:
-    """PENDING -> PROCESSING in its own transaction. Returns the name, or None if not PENDING."""
+def _start_recipient(recipient_id: uuid.UUID) -> Row[tuple[str, str | None]] | None:
+    """PENDING -> PROCESSING in its own transaction.
+
+    Returns the printed values (name, achievement) as a plain row, or None if
+    the recipient is not PENDING.
+    """
     with SessionLocal.begin() as session:
-        return session.scalar(
+        return session.execute(
             update(JobRecipient)
             .where(JobRecipient.id == recipient_id, JobRecipient.status == RecipientStatus.PENDING)
             .values(status=RecipientStatus.PROCESSING, started_at=func.now())
-            .returning(JobRecipient.name)
-        )
+            .returning(JobRecipient.name, JobRecipient.achievement)
+        ).one_or_none()
 
 
 def _generate_certificate(job_id: uuid.UUID, data: CertificateData, root: Path) -> str | RecipientFailure:

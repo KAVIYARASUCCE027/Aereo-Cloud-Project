@@ -24,6 +24,7 @@ from app.models import JobStatus, RecipientStatus
 
 # Application limit for one submission (not a requirement of the assignment).
 MAX_RECIPIENTS_PER_JOB = 1000
+MAX_ACHIEVEMENT_LENGTH = 150
 
 ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -59,6 +60,12 @@ SharedCertificateText = Annotated[
     BeforeValidator(_normalize_certificate_text),
     AfterValidator(_require_supported_characters),
 ]
+AchievementText = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=MAX_ACHIEVEMENT_LENGTH),
+    BeforeValidator(_normalize_certificate_text),
+    AfterValidator(_require_supported_characters),
+]
 
 
 class HealthResponse(BaseModel):
@@ -74,6 +81,10 @@ class RecipientInput(BaseModel):
     name: RecipientNameText = Field(examples=["Asha Sharma"])
     # Email is never printed, so the certificate text policy does not apply to it.
     email: str | None = Field(default=None, examples=["asha@example.com"])
+    # Optional line printed on the certificate. Omitted, null, or blank: none.
+    achievement: AchievementText | None = Field(
+        default=None, examples=["Outstanding Performance in Cloud Computing"]
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -94,6 +105,15 @@ class RecipientInput(BaseModel):
             return validate_email(value, check_deliverability=False).normalized
         except EmailNotValidError as exc:
             raise PydanticCustomError("email_invalid", "Invalid email address: {reason}", {"reason": str(exc)}) from exc
+
+    @field_validator("achievement", mode="before")
+    @classmethod
+    def blank_achievement_means_none(cls, value: Any) -> Any:
+        # Unlike a blank email (a malformed address), blank text just means
+        # there is nothing to print, so it is treated as not given.
+        if isinstance(value, str) and not text_policy.normalize(value):
+            return None
+        return value
 
 
 class JobCreateRequest(BaseModel):
@@ -214,6 +234,7 @@ class RecipientResult(BaseModel):
     # Validated values; null for INVALID entries.
     name: str | None
     email: str | None
+    achievement: str | None
     # For INVALID and FAILED entries.
     errors: list[FieldError] | None
     # Only for SUCCESS entries.

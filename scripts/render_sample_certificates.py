@@ -34,6 +34,14 @@ SAMPLES = {
         issuer_name="The International Academy for Continuing Professional Education in Software Engineering",
         issue_date=date(2026, 9, 30),
     ),
+    "with-achievement": CertificateData(
+        certificate_id=uuid.UUID("5d0f7a3e-9c1b-4e8a-b2f4-3a6d9e1c7b20"),
+        recipient_name="Kavi",
+        event_name="Cloud Computing Bootcamp",
+        issuer_name="ABC Academy",
+        issue_date=date(2026, 10, 7),
+        achievement="Outstanding Performance in Cloud Computing",
+    ),
     "accented-characters": CertificateData(
         certificate_id=uuid.UUID("c9bf9e57-1685-4c89-bafb-ff5af830be8a"),
         recipient_name="Zoë Ångström-Łukasiewicz",

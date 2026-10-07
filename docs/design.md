@@ -56,6 +56,7 @@ Celery task state, so no Celery result backend is configured.
 | Recipients | Required list, 1–1,000 entries (`MAX_RECIPIENTS_PER_JOB` in `app/schemas.py`) |
 | Recipient name | Required string; NFC-normalized and trimmed; 1–150 characters; supported characters only |
 | Recipient email | Optional or `null`; when a string is given, its syntax is validated (not subject to the character rules, because it is never printed) |
+| Recipient achievement | Optional; omitted, `null`, or blank (after trimming) means none. Otherwise NFC-normalized and trimmed; 1–150 characters (`MAX_ACHIEVEMENT_LENGTH`); supported characters only. Errors make only that entry `INVALID` (field `achievement`). Unlike a blank email, blank text is not an error: there is simply nothing to print |
 | Duplicate names or emails | Allowed; each entry processed independently |
 | Invalid shared information | `422`, no records created |
 | Some invalid recipients | Job accepted; those entries stored as `INVALID` |
@@ -159,7 +160,8 @@ exception objects, stack traces, and internal paths are never stored.
 Migrations (`migrations/versions/`): `f8fdd795353d` creates the tables;
 `da47b265b133` adds recipient processing timestamps and outcome rules;
 `56bdc5b0374c` lets a recipient be `FAILED` without having started (needed
-when its job could not be queued).
+when its job could not be queued); `0e711d3894cc` adds the optional recipient
+`achievement`.
 
 `generation_jobs`
 
@@ -184,6 +186,7 @@ when its job could not be queued).
 | `input_index` | integer | zero-based; CHECK `>= 0` |
 | `name` | varchar(150), nullable | validated value; `NULL` for `INVALID` rows |
 | `email` | varchar(320), nullable | validated, normalized; `NULL` for `INVALID` rows |
+| `achievement` | varchar(150), nullable | validated, normalized; `NULL` when not given and for `INVALID` rows (`ck_job_recipients_invalid_has_no_achievement`) |
 | `status` | varchar(32) | CHECK: one of the recipient states |
 | `error_details` | JSONB, nullable | list of error objects; Python `None` is stored as SQL `NULL` |
 | `storage_key` | varchar(255), nullable | `{id}.pdf`, set together with `SUCCESS` |
@@ -499,7 +502,13 @@ pure function of its input: no FastAPI, Celery, database, or file writes
 "CERTIFICATE / OF PARTICIPATION", "This is to certify that", recipient name,
 "has participated in", event name, issuer ("Issued by") and issue date
 ("Date of issue", formatted like `7 October 2026` without using the system
-locale), and the certificate ID in the footer. PDF metadata: title, author
+locale), and the certificate ID in the footer. With an optional
+`achievement`, the event area gets less height (`ACHIEVEMENT_FIELD_SPECS`)
+and "and is recognized for" plus the achievement line are added below it;
+without one, the original `FIELD_SPECS` layout is used unchanged (tested).
+The achievement reaches the worker like every other recipient value: the
+queued message still carries only the job ID, and `process_job` reads the
+value from PostgreSQL when it starts the recipient. PDF metadata: title, author
 (issuer), subject (event).
 
 **Long text.** Each variable text has a fixed area (`FIELD_SPECS`). The

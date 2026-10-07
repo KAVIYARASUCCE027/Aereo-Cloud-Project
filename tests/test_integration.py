@@ -189,3 +189,22 @@ def test_unreachable_broker_gives_503_and_a_failed_job_never_a_false_success(sto
     )
     assert elapsed < 10  # a refused connection fails fast; recorded for the docs
     assert uuid.UUID(detail["job_id"])
+
+
+def test_real_worker_prints_the_optional_achievement(test_redis: str, storage_root: Path, tmp_path: Path) -> None:
+    request = json.loads((PROJECT_ROOT / "examples" / "job-request-with-achievement.json").read_text(encoding="utf-8"))
+    env = process_env(test_redis, storage_root)
+
+    with worker_process(env, tmp_path / "worker.log"), api_process(env, tmp_path / "api.log") as api:
+        job_id = api.post("/api/v1/jobs", json=request).json()["job_id"]
+        final = poll_until_finished(api, job_id)
+        items = api.get(f"/api/v1/jobs/{job_id}/recipients").json()["items"]
+        texts = {
+            item["name"]: PdfReader(io.BytesIO(api.get(item["download_url"]).content)).pages[0].extract_text()
+            for item in items
+        }
+
+    assert final["status"] == "COMPLETED"
+    assert [item["achievement"] for item in items] == ["Outstanding Performance in Cloud Computing", None]
+    assert "Outstanding Performance in Cloud Computing" in texts["Kavi"]
+    assert "recognized" not in texts["Asha Sharma"]  # no achievement: the original layout
