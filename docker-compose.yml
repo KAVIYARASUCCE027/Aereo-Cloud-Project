@@ -104,8 +104,12 @@ services:
     environment:
       <<: *app-environment
       TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-certificates}:${POSTGRES_PASSWORD:-certificates}@db:5432/${POSTGRES_DB:-certificates}_test
+      # Integration tests only: a Redis database the application worker does not consume (it uses 0).
+      TEST_REDIS_URL: redis://redis:6379/1
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:

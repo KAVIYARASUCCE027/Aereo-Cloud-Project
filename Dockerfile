@@ -36,6 +36,8 @@ RUN pip install -r requirements-dev.txt
 COPY pyproject.toml .
 COPY tests ./tests
 COPY scripts ./scripts
+# Integration tests submit the documented sample requests.
+COPY examples ./examples
 USER app
 
 # /app is not writable by the app user, and the cache has no value in a throwaway container.

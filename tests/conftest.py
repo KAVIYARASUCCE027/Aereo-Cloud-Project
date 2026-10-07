@@ -35,6 +35,8 @@ except UnsafeTestDatabaseError as exc:
     pytest.exit(f"Refusing to run tests: {exc}", returncode=pytest.ExitCode.USAGE_ERROR)
 
 os.environ["DATABASE_URL"] = TEST_DATABASE.render_as_string(hide_password=False)
+# Kept for the integration tests' guard: their Redis database must not be this one.
+APPLICATION_BROKER_URL = os.environ.get("CELERY_BROKER_URL")
 os.environ["CELERY_BROKER_URL"] = TEST_BROKER_URL = "memory://"
 
 # Imported only now, so the engine is created with the test database URL.

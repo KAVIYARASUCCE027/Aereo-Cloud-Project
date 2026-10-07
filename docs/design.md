@@ -3,7 +3,7 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 6 complete.** Jobs are submitted over HTTP, stored,
+**Current state: Phase 7 complete.** Jobs are submitted over HTTP, stored,
 and published to Redis; a separate Celery worker runs `process_job(job_id)`;
 clients poll status, page through recipient results, and download PDFs (see
 [Current limitations](#current-limitations)).
@@ -559,8 +559,35 @@ database stores only metadata and a `storage_key`.
   redelivery for finished and claimed jobs, and simulates broker outages by
   replacing the task object with one that raises kombu's `OperationalError`.
   Most API tests replace `enqueue_job` with a recorder.
-- Not yet automated: a real Redis + worker round trip. It was checked by
-  hand in the Phase 5 demo and is the Phase 7 integration test.
+- **Integration tests** (`tests/test_integration.py`, marker `integration`)
+  start a real `uvicorn` API process and a real `celery worker` process,
+  connected through Redis database 1 (`TEST_REDIS_URL`; the application
+  worker consumes database 0, and a guard refuses to use the same one), with
+  the test database and temporary storage. They submit the documented sample
+  request over HTTP, poll until the job finishes, list results, and download
+  the PDFs; and they check a real unreachable broker gives `503` and a
+  `FAILED` job. Skip them with `pytest -m "not integration"`.
+
+### Checklist coverage
+
+| Scenario | Expected | Tests |
+|---|---|---|
+| Valid batch | job created; all PDFs generated | `test_jobs_api::test_valid_batch_creates_queued_job_and_pending_recipients`, `test_generation::test_all_valid_recipients_produce_real_parseable_pdfs` |
+| Missing event information | `422`, no job | `test_jobs_api::test_missing_shared_field_returns_422`, `::test_invalid_shared_fields_return_422_and_create_nothing` |
+| Empty recipient list | `422` | `test_jobs_api::test_empty_recipient_list_returns_422` |
+| Batch above the limit | `422` | `test_jobs_api::test_more_than_the_recipient_limit_returns_422` (and `::test_exactly_the_recipient_limit_is_accepted`) |
+| Mixed valid and invalid | valid continue; invalid keep errors | `test_jobs_api::test_mixed_batch_keeps_valid_and_invalid_outcomes`, `test_generation::test_invalid_recipients_are_skipped` |
+| Malformed individual entry | rejected alone | `test_jobs_api::test_malformed_entries_do_not_reject_a_valid_sibling`, `test_validation::test_non_object_entry_is_invalid_as_a_whole` |
+| All recipients invalid | `422` with indexed errors | `test_jobs_api::test_all_invalid_recipients_return_422_with_indexed_errors` |
+| Duplicate names | distinct IDs and files | `test_jobs_api::test_duplicate_names_get_distinct_recipient_ids`, `test_generation::test_duplicate_names_get_distinct_certificate_ids_and_files` |
+| PDF generation | parseable, expected text | `test_pdf::test_pdf_contains_every_certificate_detail` and the rest of `test_pdf.py` |
+| One renderer failure | others still succeed | `test_generation::test_renderer_failure_for_the_middle_recipient_does_not_stop_the_next`, `test_results_api::test_one_injected_failure_leaves_the_others_downloadable` |
+| Progress | counts add up; 100% at the end | `test_results_api::test_status_during_processing_matches_the_recipient_rows` (paused at a controlled point), `::test_status_after_processing`, `test_progress.py` |
+| Successful download | correct PDF response | `test_results_api::test_download_returns_the_pdf_with_type_and_filename` |
+| Missing or unfinished certificate | documented error | `test_results_api::test_download_of_an_unknown_certificate_returns_404`, `::test_download_of_an_unfinished_certificate_returns_409_not_ready`, `::test_successful_certificate_with_a_missing_file_returns_500` |
+| Queue unavailable | explicit error, no false success | `test_dispatch::test_broker_outage_returns_503_and_marks_the_job_failed`, `test_integration::test_unreachable_broker_gives_503_and_a_failed_job_never_a_false_success` |
+| Repeated processing attempt | no duplicate results | `test_generation::test_reprocessing_a_finished_job_generates_nothing`, `::test_simultaneous_claims_have_exactly_one_winner`, `test_dispatch::test_redelivered_message_for_a_claimed_job_does_nothing` |
+| Real worker integration | API-created job produces downloadable files | `test_integration::test_api_created_job_is_processed_by_a_real_worker_and_downloadable` |
 - PDF tests render real PDFs and read them back with pypdf.
 - Processing tests (`tests/test_generation.py`) use the real renderer and
   storage in a temporary directory. Failures are injected with `monkeypatch`
@@ -608,5 +635,6 @@ database stores only metadata and a `storage_key`.
    delivery settings, Redis persistence, measured interruption behaviour. ✅
 6. Job status (one-snapshot counts), paginated recipient results,
    certificate downloads with documented error responses. ✅
-7. Complete automated tests, including real Redis + Celery integration.
+7. Complete automated tests, including real Redis + Celery integration and
+   checklist coverage. ✅
 8. README, examples, final verification.

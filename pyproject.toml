@@ -8,3 +8,6 @@ requires-python = ">=3.12,<3.13"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+markers = [
+    "integration: starts a real Celery worker and API process against Redis (needs TEST_REDIS_URL)",
+]

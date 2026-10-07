@@ -84,6 +84,20 @@ def test_all_valid_recipients_produce_real_parseable_pdfs(create_job: CreateJob,
         assert str(row.id) in text
 
 
+def test_duplicate_names_get_distinct_certificate_ids_and_files(create_job: CreateJob, storage_root: Path) -> None:
+    same = {"name": "Asha Sharma", "email": "asha@example.com"}
+    job_id = create_job([same, same, same])
+
+    process_job(job_id, storage_root=storage_root)
+
+    rows = load_recipients(job_id)
+    assert [r.status for r in rows] == [RecipientStatus.SUCCESS] * 3
+    assert len({r.id for r in rows}) == len({r.storage_key for r in rows}) == 3
+    assert files_in(storage_root) == sorted(f"{r.id}.pdf" for r in rows)
+    for row in rows:  # each file carries its own certificate ID
+        assert str(row.id) in pdf_text(storage_root / row.storage_key)
+
+
 def test_invalid_recipients_are_skipped(create_job: CreateJob, storage_root: Path) -> None:
     job_id = create_job([{"name": "Asha"}, {"name": "", "email": "bad"}, {"name": "Rohan"}])
     invalid_before = load_recipients(job_id)[1]
