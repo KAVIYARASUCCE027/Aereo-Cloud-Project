@@ -83,6 +83,12 @@ class GenerationJob(Base):
     __table_args__ = (
         CheckConstraint(_status_in(JobStatus), name="status_valid"),
         CheckConstraint("total_count >= 1", name="total_count_positive"),
+        # completed_at is set exactly when the job has reached a terminal status.
+        CheckConstraint(
+            "(status IN ('COMPLETED', 'COMPLETED_WITH_ERRORS', 'FAILED')) = (completed_at IS NOT NULL)",
+            name="completed_at_matches_status",
+        ),
+        CheckConstraint("status <> 'PROCESSING' OR started_at IS NOT NULL", name="processing_has_started_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -134,6 +140,17 @@ class JobRecipient(Base):
             "status <> 'INVALID' OR error_details IS NOT NULL",
             name="invalid_has_error_details",
         ),
+        # SUCCESS means the PDF was saved; FAILED always explains why.
+        CheckConstraint("status <> 'SUCCESS' OR storage_key IS NOT NULL", name="success_has_storage_key"),
+        CheckConstraint("status <> 'FAILED' OR error_details IS NOT NULL", name="failed_has_error_details"),
+        CheckConstraint(
+            "status NOT IN ('PROCESSING', 'SUCCESS', 'FAILED') OR started_at IS NOT NULL",
+            name="processed_has_started_at",
+        ),
+        CheckConstraint(
+            "status NOT IN ('SUCCESS', 'FAILED') OR completed_at IS NOT NULL",
+            name="finished_has_completed_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -145,14 +162,19 @@ class JobRecipient(Base):
     name: Mapped[str | None] = mapped_column(String(150))
     email: Mapped[str | None] = mapped_column(String(320))
     status: Mapped[RecipientStatus] = mapped_column(_status_type(RecipientStatus))
-    # List of {"field", "code", "message"} objects for INVALID (and later FAILED) rows.
-    error_details: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
-    # Relative path of the generated PDF inside CERTIFICATE_STORAGE_DIR (Phase 4).
+    # List of {"field", "code", "message"} objects for INVALID and FAILED rows.
+    # none_as_null: Python None is stored as SQL NULL, not as the JSON value null,
+    # so "error_details IS NOT NULL" checks mean what they say.
+    error_details: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB(none_as_null=True))
+    # File name of the generated PDF inside CERTIFICATE_STORAGE_DIR; set with SUCCESS.
     storage_key: Mapped[str | None] = mapped_column(String(255))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # Processing timestamps; both stay NULL for INVALID rows, which are never processed.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     job: Mapped[GenerationJob] = relationship(back_populates="recipients")

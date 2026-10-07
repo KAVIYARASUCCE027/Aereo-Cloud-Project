@@ -3,9 +3,9 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 3 complete.** Jobs can be submitted and are stored,
-and a standalone renderer can produce certificate PDFs, but the two are not
-connected yet: no certificates are generated for submitted jobs (see
+**Current state: Phase 4 complete.** Jobs are submitted over HTTP and stored;
+`process_job(job_id)` generates their certificates, but it is started by a
+local command, not yet by a background worker (see
 [Current limitations](#current-limitations)).
 
 ## Stack
@@ -17,7 +17,7 @@ connected yet: no certificates are generated for submitted jobs (see
 | Database | PostgreSQL 17 |
 | DB access | SQLAlchemy 2.x (sync) with the psycopg 3 driver |
 | Migrations | Alembic (never `create_all()` at startup) |
-| Background processing | Celery, one task per job |
+| Background processing | Celery, one task per job (Phase 5) |
 | Broker | Redis |
 | PDF | ReportLab, with bundled DejaVu fonts |
 | Email syntax | email-validator (syntax only, no DNS lookups) |
@@ -25,7 +25,7 @@ connected yet: no certificates are generated for submitted jobs (see
 | Local setup | Docker Compose |
 
 Sync SQLAlchemy is used everywhere so the API and the worker share the same
-database code. Each request and each worker execution owns its own session.
+database code. Each request and each processing run owns its own sessions.
 
 ## Workflow
 
@@ -34,12 +34,13 @@ database code. Each request and each worker execution owns its own session.
 3. API validates each recipient independently, preserving its `input_index`.
 4. API saves the job and every recipient outcome in one transaction.
 5. After commit, API hands the job ID (only the ID) to `enqueue_job`.
-6. API returns `202 Accepted` with the job ID.
-7. Worker generates PDFs for valid recipients, one at a time.
-8. Worker records `SUCCESS` or `FAILED` per recipient.
+6. API returns `202 Accepted` with the job ID. The API never renders PDFs.
+7. `process_job(job_id)` generates PDFs for valid recipients, one at a time.
+8. It records `SUCCESS` or `FAILED` per recipient and finalizes the job.
 9. Client polls progress, reads per-recipient results, downloads PDFs.
 
-Steps 1–6 are implemented. Step 5 is a stub until Phase 5 (see limitations).
+Steps 1–8 are implemented. Step 5 is still a stub, so step 7 is started with
+`python -m app.cli process-job JOB_ID` until Phase 5. Step 9 is Phase 6.
 
 **PostgreSQL is the source of truth for progress.** Clients never depend on
 Celery task state, so no Celery result backend is configured.
@@ -48,12 +49,12 @@ Celery task state, so no Celery result backend is configured.
 
 | Input | Rule |
 |---|---|
-| Event name | Required string, trimmed, 1–200 characters |
-| Issuer name | Required string, trimmed, 1–200 characters |
+| Event name | Required string; NFC-normalized and trimmed; 1–200 characters; supported characters only |
+| Issuer name | Required string; NFC-normalized and trimmed; 1–200 characters; supported characters only |
 | Issue date | Required, ISO `YYYY-MM-DD` string that is a real calendar date |
 | Recipients | Required list, 1–1,000 entries (`MAX_RECIPIENTS_PER_JOB` in `app/schemas.py`) |
-| Recipient name | Required string, trimmed, 1–150 characters |
-| Recipient email | Optional or `null`; when a string is given, its syntax is validated |
+| Recipient name | Required string; NFC-normalized and trimmed; 1–150 characters; supported characters only |
+| Recipient email | Optional or `null`; when a string is given, its syntax is validated (not subject to the character rules, because it is never printed) |
 | Duplicate names or emails | Allowed; each entry processed independently |
 | Invalid shared information | `422`, no records created |
 | Some invalid recipients | Job accepted; those entries stored as `INVALID` |
@@ -70,8 +71,12 @@ How it is implemented:
   catches its `ValidationError`. Malformed entries (`null`, strings, numbers,
   lists, missing fields, wrong types) become `INVALID` without affecting
   their siblings. `input_index` is the zero-based position in the submitted list.
-- **Strings** are trimmed before length checks, so whitespace-only values
-  fail as too short. Numbers are not coerced to strings.
+- **Printed text** (name, event name, issuer name) uses the shared text
+  policy (next section), in this order: NFC-normalize and trim, then check the
+  length, then check every character. Normalizing first means `e` followed by
+  a combining accent counts as one character, and whitespace-only values fail
+  as too short. The stored value is the normalized one. Numbers are not
+  coerced to strings.
 - **Issue date** must be a `YYYY-MM-DD` string; Pydantic alone would also accept
   Unix timestamps and datetimes. `2026-02-30` is rejected.
 - **Email** is checked with `email-validator` (`check_deliverability=False`, so
@@ -79,6 +84,43 @@ How it is implemented:
   empty or whitespace-only email string is invalid; omit it or send `null`.
 - **Unknown extra fields** are ignored, at both levels.
 - The 1,000 limit is an application choice, not part of the assignment.
+
+### Certificate text policy (supported characters)
+
+`app/text_policy.py` is the single definition used by both submission
+validation and the renderer, so they cannot disagree.
+
+**Application limitation:** certificates can only display the following
+left-to-right scripts, because ReportLab does not perform glyph shaping or
+right-to-left layout, and the bundled fonts cover only these:
+
+| Range | Examples |
+|---|---|
+| Basic Latin (printable, U+0020–007E) | `A-Z a-z 0-9 & - ' .` |
+| Latin-1 Supplement (U+00A0–00FF) | `é ü ñ ç å ø ß « »` |
+| Latin Extended-A and -B (U+0100–024F) | `ł ż ő č ş ș ț` |
+| Latin Extended Additional (U+1E00–1EFF) | Vietnamese `ễ ị ừ` |
+| Greek and Coptic (U+0370–03FF) | `Αλέξανδρος` |
+| Cyrillic (U+0400–04FF) | `Дмитрий` |
+| Punctuation (U+2010–2027) | `– — ‘ ’ “ ” • …` |
+
+Within these ranges a character is supported only if both serif fonts used
+for user text can draw it and it is not a control, format (e.g. soft hyphen),
+unassigned, or combining character, and not one that NFC would replace. That
+excludes about 70 rare characters the fonts lack (historic Cyrillic, Coptic
+letters, Middle-Welsh V). Unsupported examples: Devanagari, Arabic, Hebrew,
+Thai, CJK, emoji, newline, tab, zero-width space, a combining mark with no
+precomposed form.
+
+Error code `unsupported_characters`; the message lists up to five code points
+with their Unicode names, e.g. `Contains characters certificates cannot
+display: U+0906 DEVANAGARI LETTER AA, ...`.
+
+- Unsupported recipient name: that entry is `INVALID` (field `name`).
+- Unsupported event or issuer name: `422`, no job created.
+
+Tests check that every supported character exists in every text font and that
+every supported character, submitted as names, validates and renders.
 
 ### Error formats
 
@@ -89,9 +131,17 @@ Each recipient error is a plain JSON object:
 ```
 
 `field` is `null` when the whole entry is wrong (for example `null` or not an
-object; code `model_type`). `code` is Pydantic's error type or one of ours
-(`email_invalid`, `date_format`). The submitted value, exception objects, and
-Pydantic context are never stored.
+object; code `model_type`) or when the failure is not tied to a field.
+`code` is Pydantic's error type or one of ours. The submitted value,
+exception objects, stack traces, and internal paths are never stored.
+
+| Code | Where |
+|---|---|
+| `missing`, `string_type`, `string_too_short`, `string_too_long`, `model_type` (Pydantic) | validation |
+| `email_invalid`, `date_format`, `unsupported_characters` | validation |
+| `unsupported_characters`, `text_does_not_fit`, `render_failed` | rendering (recipient `FAILED`) |
+| `storage_error` | saving the PDF failed (message names only the error kind, e.g. `ENOSPC`) |
+| `generation_error` | unexpected error while rendering (details only in logs) |
 
 | Case | `422` body |
 |---|---|
@@ -100,34 +150,37 @@ Pydantic context are never stored.
 
 ## Database
 
-Created by migration `f8fdd795353d` (`migrations/versions/`).
+Migrations (`migrations/versions/`): `f8fdd795353d` creates the tables;
+`da47b265b133` adds recipient processing timestamps and outcome rules.
 
 `generation_jobs`
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | generated by the application |
-| `event_name`, `issuer_name` | varchar(200) | validated, trimmed |
+| `event_name`, `issuer_name` | varchar(200) | validated, normalized |
 | `issue_date` | date | |
 | `status` | varchar(32) | CHECK: one of the job states |
 | `total_count` | integer | all submitted entries, valid or not; CHECK `>= 1` |
-| `error_code`, `error_message` | nullable | job-level failure only |
+| `error_code`, `error_message` | nullable | job-level failure only (used from Phase 5) |
 | `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
-| `started_at`, `completed_at` | timestamptz, nullable | set by the worker (Phase 4/5) |
+| `started_at` | timestamptz, nullable | set when a processing run claims the job |
+| `completed_at` | timestamptz, nullable | set exactly when the job becomes terminal |
 
 `job_recipients`
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | also the certificate ID for a `SUCCESS` row |
+| `id` | UUID PK | also the certificate ID |
 | `job_id` | UUID FK → `generation_jobs.id` | `ON DELETE CASCADE` |
 | `input_index` | integer | zero-based; CHECK `>= 0` |
 | `name` | varchar(150), nullable | validated value; `NULL` for `INVALID` rows |
 | `email` | varchar(320), nullable | validated, normalized; `NULL` for `INVALID` rows |
 | `status` | varchar(32) | CHECK: one of the recipient states |
-| `error_details` | JSONB, nullable | list of error objects (see above) |
-| `storage_key` | varchar(255), nullable | PDF location, set in Phase 4 |
+| `error_details` | JSONB, nullable | list of error objects; Python `None` is stored as SQL `NULL` |
+| `storage_key` | varchar(255), nullable | `{id}.pdf`, set together with `SUCCESS` |
 | `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
+| `started_at`, `completed_at` | timestamptz, nullable | processing times; both `NULL` for `INVALID` rows |
 
 Constraints and indexes:
 
@@ -135,15 +188,19 @@ Constraints and indexes:
 - `ix_job_recipients_job_id_status` on `(job_id, status)`.
 - `ck_*_status_valid` on both tables: status values are enforced by the database.
 - `ck_job_recipients_name_matches_status`: `INVALID` rows store no name or
-  email; every other row has a name. Rejected values are never written to the
-  typed columns; an invalid entry is identified by `input_index` and explained
-  by `error_details`.
-- `ck_job_recipients_invalid_has_error_details`: `INVALID` rows always explain why.
+  email; every other row has a name.
+- `ck_job_recipients_invalid_has_error_details`, `..._failed_has_error_details`:
+  `INVALID` and `FAILED` rows always explain why.
+- `ck_job_recipients_success_has_storage_key`: `SUCCESS` always names its file.
+- `ck_job_recipients_processed_has_started_at`,
+  `..._finished_has_completed_at`: processing timestamps match the status.
+- `ck_generation_jobs_completed_at_matches_status`: `completed_at` is set if
+  and only if the job is terminal; `..._processing_has_started_at`.
 
 Status columns are VARCHAR + CHECK rather than native PostgreSQL ENUM types,
-so adding a state later is a constraint change, not an `ALTER TYPE`. The
-migration spells out the status values instead of importing them from
-`app.models`, so it keeps describing the schema as it was written.
+so adding a state later is a constraint change, not an `ALTER TYPE`.
+Migrations spell out the values instead of importing `app.models`, so they
+keep describing the schema as it was written.
 
 Result counts are computed from recipient rows, not stored counters.
 `updated_at` is maintained by SQLAlchemy (`onupdate`), so raw SQL updates must
@@ -163,22 +220,25 @@ set it themselves.
 
 | State | Meaning |
 |---|---|
-| `QUEUED` | Waiting for the worker |
-| `PROCESSING` | Worker is processing recipients |
+| `QUEUED` | Waiting to be processed |
+| `PROCESSING` | Claimed by a processing run |
 | `COMPLETED` | Every recipient succeeded |
-| `COMPLETED_WITH_ERRORS` | All entries finished, with both successes and errors |
+| `COMPLETED_WITH_ERRORS` | All entries finished, with at least one success and at least one `INVALID`/`FAILED` |
 | `FAILED` | All entries finished with zero successes |
 
 ### Progress
 
+`app/services/progress.py` (`JobProgress`, `get_job_progress`):
+
 ```text
-processed        = success_count + failed_count + invalid_count
+processed        = success_count + invalid_count + failed_count
 progress_percent = processed / total_count × 100
 ```
 
-100% means every entry has a final outcome, not that every certificate
-succeeded. Infrastructure failures that end a job record an explicit job error
-and give unfinished entries a terminal failure outcome.
+Counts come from a `GROUP BY status` over recipient rows. 100% means every
+entry has a final outcome, not that every certificate succeeded. A job is
+finalized only when no entry is `PENDING` or `PROCESSING` and the counts add
+up to `total_count`; otherwise finalization is refused.
 
 ## Job creation and transaction boundary
 
@@ -193,6 +253,73 @@ and give unfinished entries a terminal failure outcome.
    no job and no recipient rows.
 3. Only after the commit, `submit_job` calls `dispatch.enqueue_job(job_id)`,
    so dispatch never sees an uncommitted job.
+
+## Processing (`process_job`)
+
+`app/services/generation.py`: `process_job(job_id, storage_root=None)`. It
+takes no request or task object, opens its own sessions, and is called by
+tests and by `python -m app.cli process-job`. Phase 5 wraps it in a Celery task.
+
+| Step | Transaction | What happens |
+|---|---|---|
+| Claim | own, committed | `UPDATE generation_jobs SET status='PROCESSING', started_at=now() WHERE id=:id AND status='QUEUED' RETURNING ...` |
+| List work | own, read only | `PENDING` recipient IDs in `input_index` order |
+| Start recipient | own, committed | `PENDING → PROCESSING`, `started_at`; reads the name (skips rows no longer `PENDING`) |
+| Render + save | **none** | `render_certificate` then `write_file_atomically` |
+| Finish recipient | own, committed | `SUCCESS` + `storage_key` + `completed_at`, or `FAILED` + `error_details` + `completed_at` |
+| Finalize | own, committed | status from recipient counts; `completed_at` |
+
+- **Claim.** Only one caller can claim a job: PostgreSQL locks the row for the
+  first `UPDATE`; a concurrent caller waits, re-evaluates `status = 'QUEUED'`
+  against the committed row, and updates nothing. Tested deterministically
+  (second caller observed waiting on the lock, then losing) and with eight
+  simultaneous callers.
+- **Outcomes.** `processed` (this call ran the job), `already_processing`
+  (another run holds the claim; nothing started), `already_finished` (terminal
+  job; nothing regenerated). An unknown ID raises `JobNotFoundError`.
+- **No open transaction while rendering.** Each step uses
+  `with SessionLocal.begin()` and ends before rendering. Only plain values
+  (UUIDs, strings, dates) leave a transaction, never ORM objects, so no lazy
+  load can start a transaction during rendering or file I/O.
+- **Stable certificate ID.** The recipient's own UUID is the certificate ID and
+  the file name (`{id}.pdf`), so any attempt for that recipient writes the same
+  file instead of creating new IDs.
+- **Failure isolation.** Render and storage exceptions are caught per
+  recipient and mapped to a stable code (see Error formats); the recipient
+  becomes `FAILED` and processing continues with the next one. Unexpected
+  exceptions are logged with job ID, recipient ID, and stack trace; the stored
+  message stays generic. Database writes happen outside that exception
+  handling, so a database error is never recorded as a certificate failure.
+- **Renderer checks are kept.** Validation already rejects unsupported text,
+  but older rows (or other callers) are still checked at render time and
+  become `FAILED` with `unsupported_characters`.
+- **Database failure.** The failed transaction is rolled back, processing
+  stops, the error is logged, and `JobProcessingError` is raised (the command
+  exits with code 2). Earlier committed results are kept. The job stays
+  `PROCESSING` and one recipient may stay `PROCESSING`; nothing currently
+  recovers such jobs (see limitations).
+
+### File and database consistency
+
+Saving the PDF (a rename) and recording `SUCCESS` (a PostgreSQL commit) are
+not one transaction. Order: the final PDF is saved first, then `SUCCESS` is
+committed, so `SUCCESS` always refers to an existing file. If the database
+write fails after the save, the file exists but no `SUCCESS` row references
+it (tested). Therefore **file existence alone never means success**; only the
+recipient row's status does. File names are stable, so a later retry would
+overwrite the same file. Temporary files are removed after ordinary write
+failures; there is no cleanup of unreferenced or abandoned temporary files.
+
+### Running it manually
+
+```bash
+docker compose exec worker python -m app.cli process-job JOB_ID
+```
+
+Prints the outcome and counts as JSON. Exit codes: `0` processed or nothing
+to do, `1` unknown job, `2` stopped by an infrastructure error.
+`--storage-dir DIR` overrides `CERTIFICATE_STORAGE_DIR`. It runs in the worker
+container so PDFs land in the shared certificate volume.
 
 ## API contract
 
@@ -241,43 +368,18 @@ until every line fits the area's width and all lines fit its height (name
 between characters. Line height uses the fonts' real ascent and descent
 (0.94 / 0.24 em), so accented capitals stay inside their area. If text still
 does not fit, `TextDoesNotFitError` is raised; text is never drawn clipped.
-Tests show the longest values validation accepts (150-character name,
-200-character event and issuer) fit even when made entirely of the widest
-supported glyph.
+Tests show the longest values validation accepts fit even when made entirely
+of the widest supported glyph.
 
 **Fonts.** DejaVu Serif, Serif Bold, and Sans 2.37 are bundled in
 `app/assets/fonts/` (Bitstream Vera license, redistributable; see the
-README and LICENSE there). ReportLab embeds only the used glyphs, and every
-font in the PDF is embedded, so output does not depend on the viewer's fonts.
+README and LICENSE there) and registered by `app/fonts.py`. ReportLab embeds
+only the used glyphs, and every font in the PDF is embedded.
 
-**Supported characters.** Text is NFC-normalized (so `e` + combining accent
-becomes `é`), then every character must be in one of these ranges *and* in the
-font:
-
-| Range | Examples |
-|---|---|
-| Basic Latin (printable, U+0020–007E) | `A-Z a-z 0-9 & - ' .` |
-| Latin-1 Supplement (U+00A0–00FF) | `é ü ñ ç å ø ß « »` |
-| Latin Extended-A and -B (U+0100–024F) | `ł ż ő č ş ș ț` |
-| Latin Extended Additional (U+1E00–1EFF) | Vietnamese `ễ ị ừ` |
-| Greek and Coptic (U+0370–03FF) | `Αλέξανδρος` |
-| Cyrillic (U+0400–04FF) | `Дмитрий` |
-| Punctuation (U+2010–2027) | `– — ‘ ’ “ ” • …` |
-
-Everything else raises `UnsupportedCharactersError` (`code =
-"unsupported_characters"`, message lists the code points), instead of
-producing a certificate with missing glyphs. That includes scripts that need
-glyph shaping or right-to-left layout, which ReportLab does not do (Devanagari,
-Arabic, Hebrew, Thai), CJK, emoji, and control or invisible characters
-(newline, tab, zero-width space).
-
-Note: validation (Phase 2) accepts any Unicode name. A name with unsupported
-characters is therefore accepted as `PENDING` and will fail at render time;
-Phase 4 records that as a `FAILED` recipient with the renderer's error code.
-
-Render errors share a base class `CertificateRenderError` with a stable
-`code` (`render_failed`, `unsupported_characters`, `text_does_not_fit`) and
-the `field` that caused it, ready to be stored in `error_details`.
+**Characters.** The renderer applies the shared text policy and additionally
+checks the glyph table of the exact font each field uses. Errors share the
+base class `CertificateRenderError` with a stable `code` (`render_failed`,
+`unsupported_characters`, `text_does_not_fit`) and the `field` that caused it.
 
 ## Storage
 
@@ -285,16 +387,16 @@ the `field` that caused it, ready to be stored in `error_details`.
 and worker containers (`CERTIFICATE_STORAGE_DIR`, a named Docker volume). The
 database stores only metadata and a `storage_key`.
 
-- **Key:** `{certificate_id}.pdf`, built from the generated recipient ID,
-  never from user input. `resolve_storage_path` refuses any key that would
-  resolve outside the storage root.
+- **Key:** `{certificate_id}.pdf`, built from the recipient ID, never from user
+  input. `resolve_storage_path` refuses any key that would resolve outside the
+  storage root.
 - **Atomic write:** bytes go to a hidden temporary file in the target's own
   directory (same filesystem), are flushed and `fsync`ed, then `os.replace`
   swaps it into place, and the directory is `fsync`ed (POSIX). Readers see the
   old file, the complete new file, or no file; never a partial PDF. On error
   the temporary file is removed and any previous file is left untouched.
 - **Not handled:** if the process is killed mid-write, a `.<key>.*.tmp` file
-  can remain. It is never served (not a valid key) but is not cleaned up yet.
+  can remain. It is never served (not a valid key) but is not cleaned up.
 
 ## Testing
 
@@ -308,12 +410,15 @@ database stores only metadata and a `storage_key`.
   and must differ from the application database name. Every create, drop,
   migrate, and truncate helper rechecks the name. Otherwise the run stops
   with exit code 4 before touching any database.
-- Queue dispatch is replaced by a recorder in API tests. No live queue
-  processing yet.
-- PDF tests render real PDFs and read them back with pypdf: page count and
-  size, every expected string, accented / Greek / Cyrillic names, NFC
-  normalization, worst-case long text, unsupported characters, embedded fonts,
-  and that character spacing cannot leak into later text.
+- Queue dispatch is replaced by a recorder in API tests. No live queue yet.
+- PDF tests render real PDFs and read them back with pypdf.
+- Processing tests (`tests/test_generation.py`) use the real renderer and
+  storage in a temporary directory. Failures are injected with `monkeypatch`
+  (renderer, `os.replace` inside the real atomic write) or a SQLAlchemy
+  `before_cursor_execute` hook that raises a real driver error; there is no
+  public parameter for failing certificates. Concurrency tests synchronize
+  with events, a barrier, and a check for a session waiting on a row lock,
+  not with fixed sleeps.
 - Sample certificates for manual review are in `examples/sample-certificates/`
   (regenerate with `python -m scripts.render_sample_certificates DIR`).
 - Known warning: Starlette prints `StarletteDeprecationWarning: Using httpx
@@ -323,12 +428,18 @@ database stores only metadata and a `storage_key`.
 ## Current limitations
 
 - **No background dispatch yet.** `enqueue_job` only logs a warning; nothing
-  is published to Redis. Jobs stay `QUEUED` and recipients stay `PENDING`
-  until Phases 4–5. Phase 5 replaces the body of `enqueue_job`.
-- **Renderer not connected yet.** Nothing calls `render_certificate` for a
-  job until Phase 4 (`process_job`).
-- Names with unsupported characters pass validation and will only fail at
-  render time (see Certificate rendering).
+  is published to Redis. Jobs stay `QUEUED` until someone runs
+  `python -m app.cli process-job`. Phase 5 replaces the body of `enqueue_job`.
+- **No crash recovery.** If a run dies or hits a database error, the job stays
+  `PROCESSING` (and possibly one recipient too). `process_job` will not touch
+  it again (`already_processing`), and nothing detects abandoned jobs or marks
+  their unfinished entries as failed. Deferred.
+- **Unreferenced files** can remain after a database failure that follows a
+  successful save, and abandoned temporary files after a killed write. No
+  cleanup exists.
+- **Character coverage** is limited to the scripts listed in the text policy.
+- Recipients are processed sequentially; the pending ID list for a job is read
+  into memory at once (fine for 1,000 recipients).
 - `status_url` points at `GET /api/v1/jobs/{job_id}`, which returns `404`
   until Phase 6.
 - Submitting the same request twice creates two jobs (no idempotency key).
@@ -342,7 +453,8 @@ database stores only metadata and a `storage_key`.
 2. Models, migration, recipient validation, `POST /api/v1/jobs`, isolated
    test database (moved forward from Phase 7). ✅
 3. Standalone ReportLab certificate renderer and atomic storage. ✅
-4. `process_job(job_id)` with per-recipient failure isolation.
+4. `process_job(job_id)` with per-recipient failure isolation, shared text
+   policy at submission, manual processing command. ✅
 5. Celery and Redis integration with atomic job claim.
 6. Job status, recipient results, downloads.
 7. Complete automated tests, including real Redis + Celery integration.

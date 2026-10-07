@@ -28,10 +28,67 @@ def test_email_is_optional(entry: dict[str, object]) -> None:
     assert result.valid == [ValidRecipient(input_index=0, name="Rohan", email=None)]
 
 
-def test_accented_and_non_latin_names_are_accepted() -> None:
-    result = validate_recipients([{"name": "José Müller"}, {"name": "आशा शर्मा"}])
+def test_accented_greek_and_cyrillic_names_are_accepted() -> None:
+    names = ["José Müller", "Zoë Ångström-Łukasiewicz", "Nguyễn Thị Minh Khai", "Αλέξανδρος", "Дмитрий"]
 
-    assert [recipient.name for recipient in result.valid] == ["José Müller", "आशा शर्मा"]
+    result = validate_recipients([{"name": name} for name in names])
+
+    assert result.invalid == []
+    assert [recipient.name for recipient in result.valid] == names
+
+
+def test_decomposed_accents_are_composed_before_validation() -> None:
+    result = validate_recipients([{"name": "  Jose\u0301 Mu\u0308ller "}])
+
+    assert result.valid[0].name == "José Müller"  # NFC, trimmed
+
+
+def test_length_is_counted_after_normalization() -> None:
+    # "e" + combining accent is two code points but one character after NFC.
+    result = validate_recipients([{"name": "e\u0301" * 150}, {"name": "e\u0301" * 151}])
+
+    assert [recipient.input_index for recipient in result.valid] == [0]
+    assert result.valid[0].name == "é" * 150
+    assert result.invalid[0].errors[0]["code"] == "string_too_long"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "आशा शर्मा",
+        "王小明",
+        "محمد",
+        "Asha 🙂",
+        "Asha\nSharma",
+        "Zero\u200bWidth",
+        "n\u0308",  # combining mark with no precomposed form
+        "Ѡ",  # historic Cyrillic letter the bundled fonts cannot draw
+    ],
+    ids=["devanagari", "cjk", "arabic", "emoji", "newline", "zero-width-space", "lone-combining-mark", "font-gap"],
+)
+def test_names_certificates_cannot_display_are_invalid(name: str) -> None:
+    invalid = only_invalid({"name": name})
+
+    [error] = invalid.errors
+    assert (error["field"], error["code"]) == ("name", "unsupported_characters")
+    assert "U+" in error["message"]
+
+
+def test_unsupported_characters_message_names_the_characters() -> None:
+    invalid = only_invalid({"name": "आशा"})
+
+    # "आशा" is three code points: letter AA, letter SHA, vowel sign AA.
+    assert invalid.errors[0]["message"] == (
+        "Contains characters certificates cannot display: "
+        "U+0906 DEVANAGARI LETTER AA, U+0936 DEVANAGARI LETTER SHA, U+093E DEVANAGARI VOWEL SIGN AA"
+    )
+
+
+def test_email_is_not_subject_to_certificate_character_rules() -> None:
+    # Email is never printed, so only its syntax is checked.
+    result = validate_recipients([{"name": "Asha", "email": "用户@example.com"}])
+
+    assert result.valid == [ValidRecipient(input_index=0, name="Asha", email="用户@example.com")]
 
 
 def test_name_length_limit_is_150_characters() -> None:

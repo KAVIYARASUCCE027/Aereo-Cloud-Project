@@ -95,6 +95,49 @@ def test_database_rejects_invalid_row_without_error_details() -> None:
         insert_recipient(connection, insert_job(connection), status="INVALID", name=None)
 
 
+def insert_finished_recipient(connection: Connection, status: str, storage_key: str | None) -> None:
+    # Timestamps are set so that only the rule under test can be violated.
+    connection.execute(
+        text(
+            "INSERT INTO job_recipients (id, job_id, input_index, name, status, storage_key, started_at, completed_at) "
+            "VALUES (:id, :job_id, 0, 'Asha', :status, :storage_key, now(), now())"
+        ),
+        {"id": uuid.uuid4(), "job_id": insert_job(connection), "status": status, "storage_key": storage_key},
+    )
+
+
+def test_database_requires_a_storage_key_for_success() -> None:
+    with pytest.raises(IntegrityError, match="ck_job_recipients_success_has_storage_key"), engine.begin() as connection:
+        insert_finished_recipient(connection, "SUCCESS", storage_key=None)
+
+
+def test_database_requires_error_details_for_failed() -> None:
+    with pytest.raises(IntegrityError, match="ck_job_recipients_failed_has_error_details"), engine.begin() as connection:
+        insert_finished_recipient(connection, "FAILED", storage_key=None)
+
+
+def test_database_requires_timestamps_for_processed_recipients() -> None:
+    with pytest.raises(IntegrityError, match="ck_job_recipients_processed_has_started_at"), engine.begin() as connection:
+        insert_recipient(connection, insert_job(connection), status="PROCESSING")
+
+
+@pytest.mark.parametrize(
+    ("status", "completed_at", "constraint"),
+    [
+        ("COMPLETED", None, "ck_generation_jobs_completed_at_matches_status"),
+        ("QUEUED", "now()", "ck_generation_jobs_completed_at_matches_status"),
+        ("PROCESSING", None, "ck_generation_jobs_processing_has_started_at"),
+    ],
+)
+def test_database_ties_job_timestamps_to_status(status: str, completed_at: str | None, constraint: str) -> None:
+    with pytest.raises(IntegrityError, match=constraint), engine.begin() as connection:
+        job_id = insert_job(connection)
+        connection.execute(
+            text(f"UPDATE generation_jobs SET status = :status, completed_at = {completed_at or 'NULL'} WHERE id = :id"),
+            {"status": status, "id": job_id},
+        )
+
+
 def test_migration_downgrades_and_upgrades_cleanly(test_database: URL) -> None:
     run_alembic(test_database, "downgrade", "base")
     assert set(inspect(engine).get_table_names()) == {"alembic_version"}

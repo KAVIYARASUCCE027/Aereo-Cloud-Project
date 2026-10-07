@@ -357,3 +357,68 @@ def test_failed_persistence_rolls_back_job_and_recipients(
     # ...and the rollback removed it along with everything else.
     assert_nothing_persisted(db_session)
     assert dispatched == []
+
+
+# --- certificate text policy at submission ------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["event_name", "issuer_name"])
+@pytest.mark.parametrize("text", ["आशा अकादमी", "Launch Party 🚀", "Line one\nLine two"])
+def test_unsupported_characters_in_shared_fields_return_422_and_create_nothing(
+    client: TestClient, db_session: Session, dispatched: list[Any], job_payload: Payload, field: str, text: str
+) -> None:
+    payload = job_payload([{"name": "Asha"}]) | {field: text}
+
+    response = client.post(JOBS_URL, json=payload)
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert (error["loc"], error["type"]) == (["body", field], "unsupported_characters")
+    assert "U+" in error["msg"]
+    assert_nothing_persisted(db_session)
+    assert dispatched == []
+
+
+def test_unsupported_recipient_name_is_invalid_while_siblings_stay_pending(
+    client: TestClient, db_session: Session, dispatched: list[Any], job_payload: Payload
+) -> None:
+    payload = job_payload([{"name": "Asha Sharma"}, {"name": "आशा शर्मा"}, {"name": "Rohan Gupta"}])
+
+    response = client.post(JOBS_URL, json=payload)
+
+    assert response.status_code == 202
+    assert (response.json()["valid_count"], response.json()["invalid_count"]) == (2, 1)
+    rows = recipients_of(db_session, response.json()["job_id"])
+    assert [(r.input_index, r.status) for r in rows] == [
+        (0, RecipientStatus.PENDING),
+        (1, RecipientStatus.INVALID),
+        (2, RecipientStatus.PENDING),
+    ]
+    [error] = rows[1].error_details
+    assert (error["field"], error["code"]) == ("name", "unsupported_characters")
+    assert "U+0906 DEVANAGARI LETTER AA" in error["message"]
+
+
+def test_all_recipients_unsupported_returns_422(
+    client: TestClient, db_session: Session, dispatched: list[Any], job_payload: Payload
+) -> None:
+    response = client.post(JOBS_URL, json=job_payload([{"name": "王小明"}, {"name": "محمد"}]))
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["code"] == "all_recipients_invalid"
+    assert [e["errors"][0]["code"] for e in detail["recipient_errors"]] == ["unsupported_characters"] * 2
+    assert_nothing_persisted(db_session)
+
+
+def test_decomposed_accents_are_stored_composed(
+    client: TestClient, db_session: Session, dispatched: list[Any], job_payload: Payload
+) -> None:
+    payload = job_payload([{"name": "Jose\u0301"}], event_name="Cafe\u0301 Workshop", issuer_name=" E\u0301cole ")
+
+    response = client.post(JOBS_URL, json=payload)
+
+    assert response.status_code == 202
+    job = db_session.get(GenerationJob, uuid.UUID(response.json()["job_id"]))
+    assert (job.event_name, job.issuer_name) == ("Café Workshop", "École")
+    assert recipients_of(db_session, response.json()["job_id"])[0].name == "José"

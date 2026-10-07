@@ -10,33 +10,28 @@ font size reduced step by step until it fits its area; a word too long for a
 line is broken between characters. If text cannot fit even at the minimum
 size, TextDoesNotFitError is raised instead of drawing clipped text.
 
-Characters: text is NFC-normalized, then checked against SUPPORTED_RANGES and
-the font's glyph table. Anything else (for example Devanagari, CJK, Arabic,
-emoji, control characters) raises UnsupportedCharactersError rather than
-producing a certificate with missing glyphs.
+Characters: text is normalized and checked with the shared rules in
+app/text_policy.py (the same rules submission validation uses), plus the
+glyph table of the exact font each field uses. Anything unsupported raises
+UnsupportedCharactersError rather than producing a certificate with missing
+glyphs. Validation already rejects such text; the check here still protects
+older records and any other caller.
 """
 
 import io
-import unicodedata
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
-from functools import cache
-from pathlib import Path
 from typing import Literal
 
 from reportlab.lib.colors import Color, HexColor
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen.canvas import Canvas
 
-FONT_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
-SERIF = "DejaVuSerif"
-SERIF_BOLD = "DejaVuSerif-Bold"
-SANS = "DejaVuSans"
-FONT_FILES = {SERIF: "DejaVuSerif.ttf", SERIF_BOLD: "DejaVuSerif-Bold.ttf", SANS: "DejaVuSans.ttf"}
+from app import text_policy
+from app.fonts import SANS, SERIF, SERIF_BOLD, glyph_table, register_fonts
 
 # Vertical extent of DejaVu glyphs, in em, from the fonts' hhea table.
 # ReportLab's own ascent (0.76 em) is lower than accented capitals reach.
@@ -45,18 +40,6 @@ FONT_DESCENT = 0.24
 # Line height as a multiple of font size; must exceed FONT_ASCENT + FONT_DESCENT.
 LEADING = 1.25
 FONT_SIZE_STEP = 0.5
-
-# Left-to-right scripts that need no glyph shaping, so ReportLab draws them correctly.
-SUPPORTED_RANGES: tuple[tuple[int, int, str], ...] = (
-    (0x0020, 0x007E, "Basic Latin (printable)"),
-    (0x00A0, 0x00FF, "Latin-1 Supplement"),
-    (0x0100, 0x017F, "Latin Extended-A"),
-    (0x0180, 0x024F, "Latin Extended-B"),
-    (0x0370, 0x03FF, "Greek and Coptic"),
-    (0x0400, 0x04FF, "Cyrillic"),
-    (0x1E00, 0x1EFF, "Latin Extended Additional"),
-    (0x2010, 0x2027, "Dashes, quotation marks, bullet, ellipsis"),
-)
 
 PAGE_WIDTH, PAGE_HEIGHT = landscape(A4)  # 841.9 x 595.3 points
 BORDER_INSET = 18.0
@@ -170,7 +153,7 @@ def render_certificate(data: CertificateData) -> bytes:
 
 def layout_certificate(data: CertificateData) -> list[TextBlock]:
     """Fit every variable text into its area. Raises CertificateRenderError subclasses."""
-    _register_fonts()
+    register_fonts()
     texts = {
         "recipient_name": data.recipient_name,
         "event_name": data.event_name,
@@ -191,17 +174,19 @@ def format_issue_date(value: date) -> str:
 
 
 def prepare_text(field: str, text: str, font_name: str) -> str:
-    """NFC-normalize (so 'e' + combining accent becomes 'é') and check every character."""
-    normalized = unicodedata.normalize("NFC", text).strip()
+    """Normalize with the shared text policy and check every character."""
+    normalized = text_policy.normalize(text)
     if not normalized:
         raise CertificateRenderError(field, f"{field} is empty")
 
-    glyphs = _glyph_table(font_name)
-    unsupported = sorted({char for char in normalized if not _in_supported_ranges(char) or ord(char) not in glyphs})
+    glyphs = glyph_table(font_name)
+    unsupported = sorted(
+        set(text_policy.unsupported_characters(normalized)) | {char for char in normalized if ord(char) not in glyphs}
+    )
     if unsupported:
-        code_points = ", ".join(f"U+{ord(char):04X}" for char in unsupported)
         raise UnsupportedCharactersError(
-            field, f"{field} contains characters the certificate font cannot render: {code_points}"
+            field,
+            f"{field} contains characters certificates cannot display: {text_policy.describe_characters(unsupported)}",
         )
     return normalized
 
@@ -251,22 +236,6 @@ def _break_word(word: str, width: Callable[[str], float], max_width: float) -> l
             current += char
     pieces.append(current)
     return pieces
-
-
-def _in_supported_ranges(char: str) -> bool:
-    code_point = ord(char)
-    return any(start <= code_point <= end for start, end, _ in SUPPORTED_RANGES)
-
-
-@cache  # registers once per process
-def _register_fonts() -> None:
-    for name, filename in FONT_FILES.items():
-        pdfmetrics.registerFont(TTFont(name, FONT_DIR / filename))
-
-
-def _glyph_table(font_name: str) -> dict[int, int]:
-    _register_fonts()
-    return pdfmetrics.getFont(font_name).face.charToGlyph
 
 
 def _draw_block(canvas: Canvas, block: TextBlock) -> None:

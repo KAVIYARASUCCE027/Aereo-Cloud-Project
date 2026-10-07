@@ -3,18 +3,62 @@
 import re
 import uuid
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from email_validator import EmailNotValidError, validate_email
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    SkipValidation,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
+from app import text_policy
 from app.models import JobStatus
 
 # Application limit for one submission (not a requirement of the assignment).
 MAX_RECIPIENTS_PER_JOB = 1000
 
 ISO_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _normalize_certificate_text(value: Any) -> Any:
+    # Runs before the length check, so a decomposed accent counts as one character.
+    return text_policy.normalize(value) if isinstance(value, str) else value
+
+
+def _require_supported_characters(value: str) -> str:
+    unsupported = text_policy.unsupported_characters(value)
+    if unsupported:
+        raise PydanticCustomError(
+            "unsupported_characters",
+            "Contains characters certificates cannot display: {characters}",
+            {"characters": text_policy.describe_characters(unsupported)},
+        )
+    return value
+
+
+# Text printed on the certificate, in validation order: NFC-normalize and trim,
+# check 1..N characters, then check every character against the text policy.
+# The renderer applies the same policy (app/text_policy.py).
+RecipientNameText = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=150),
+    BeforeValidator(_normalize_certificate_text),
+    AfterValidator(_require_supported_characters),
+]
+SharedCertificateText = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=200),
+    BeforeValidator(_normalize_certificate_text),
+    AfterValidator(_require_supported_characters),
+]
 
 
 class HealthResponse(BaseModel):
@@ -27,7 +71,8 @@ class RecipientInput(BaseModel):
 
     model_config = ConfigDict(str_strip_whitespace=True)
 
-    name: str = Field(min_length=1, max_length=150, examples=["Asha Sharma"])
+    name: RecipientNameText = Field(examples=["Asha Sharma"])
+    # Email is never printed, so the certificate text policy does not apply to it.
     email: str | None = Field(default=None, examples=["asha@example.com"])
 
     @model_validator(mode="before")
@@ -70,8 +115,8 @@ class JobCreateRequest(BaseModel):
         },
     )
 
-    event_name: str = Field(min_length=1, max_length=200)
-    issuer_name: str = Field(min_length=1, max_length=200)
+    event_name: SharedCertificateText
+    issuer_name: SharedCertificateText
     issue_date: date
     # Only the list itself (type and length) is validated here. SkipValidation
     # leaves each entry exactly as submitted, so one malformed entry cannot

@@ -14,18 +14,16 @@ from pypdf.generic import ContentStream
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFontFile
 
+from app.fonts import FONT_DIR, FONT_FILES
 from app.schemas import JobCreateRequest, RecipientInput
 from app.services.pdf import (
     FIELD_SPECS,
     FONT_ASCENT,
     FONT_DESCENT,
-    FONT_DIR,
-    FONT_FILES,
     INNER_BORDER_INSET,
     LEADING,
     PAGE_HEIGHT,
     PAGE_WIDTH,
-    SUPPORTED_RANGES,
     Box,
     CertificateData,
     FieldSpec,
@@ -38,6 +36,7 @@ from app.services.pdf import (
     render_certificate,
     wrap_text,
 )
+from app.text_policy import supported_code_points
 from tests.database import PROJECT_ROOT
 
 CERTIFICATE_ID = uuid.UUID("7e524b50-7651-49c0-a997-aedcaa1c434d")
@@ -66,8 +65,7 @@ def max_length(model: type, field: str) -> int:
 
 
 def widest_supported_char(font_name: str) -> str:
-    glyphs = pdfmetrics.getFont(font_name).face.charToGlyph
-    candidates = [chr(c) for start, end, _ in SUPPORTED_RANGES for c in range(start, end + 1) if c in glyphs]
+    candidates = [chr(code_point) for code_point in supported_code_points()]
     return max(candidates, key=lambda char: pdfmetrics.stringWidth(char, font_name, 10))
 
 
@@ -126,7 +124,7 @@ def test_supported_accented_and_non_latin_names_render_correctly(name: str) -> N
 
 
 def test_decomposed_accents_are_normalized_before_rendering() -> None:
-    decomposed = "José Müller"  # e + combining acute, u + combining diaeresis
+    decomposed = "Jose\u0301 Mu\u0308ller"  # e + combining acute, u + combining diaeresis
 
     text = page_text(render_certificate(replace(SAMPLE, recipient_name=decomposed)))
 
@@ -284,7 +282,7 @@ def test_line_height_leaves_room_for_the_fonts_real_ascent_and_descent() -> None
 
 @pytest.mark.parametrize(
     "name",
-    ["आशा शर्मा", "王小明", "محمد", "Asha 🙂", "Asha\nSharma", "Zero​Width", "Asha\tSharma"],
+    ["आशा शर्मा", "王小明", "محمد", "Asha 🙂", "Asha\nSharma", "Zero\u200bWidth", "Asha\tSharma"],
     ids=["devanagari", "cjk", "arabic", "emoji", "newline", "zero-width-space", "tab"],
 )
 def test_unsupported_characters_raise_a_specific_error(name: str) -> None:
