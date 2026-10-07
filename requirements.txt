@@ -29,6 +29,10 @@ click-plugins==1.1.1.2
     # via celery
 click-repl==0.4.1
     # via celery
+dnspython==2.8.0
+    # via email-validator
+email-validator==2.3.0
+    # via -r requirements.in
 fastapi==0.142.2
     # via -r requirements.in
 h11==0.16.0
@@ -36,7 +40,9 @@ h11==0.16.0
 httptools==0.8.0
     # via uvicorn
 idna==3.20
-    # via anyio
+    # via
+    #   anyio
+    #   email-validator
 kombu==5.6.2
     # via celery
 mako==1.4.3

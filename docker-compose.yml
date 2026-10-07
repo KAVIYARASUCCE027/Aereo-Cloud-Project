@@ -77,17 +77,19 @@ services:
         condition: service_healthy
 
   # Not started by `up`. Run with: docker compose run --rm --build tests
+  # Tests use their own database (TEST_DATABASE_URL), which they drop, recreate,
+  # and migrate on every run. They refuse to run against the application database.
   tests:
     profiles: ["test"]
     build:
       context: .
       target: dev
     command: ["pytest", "-v"]
-    environment: *app-environment
+    environment:
+      <<: *app-environment
+      TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-certificates}:${POSTGRES_PASSWORD:-certificates}@db:5432/${POSTGRES_DB:-certificates}_test
     depends_on:
-      migrate:
-        condition: service_completed_successfully
-      redis:
+      db:
         condition: service_healthy
 
 volumes:

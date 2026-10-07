@@ -8,10 +8,9 @@ from app.db import get_db
 from app.main import app
 
 
-def test_health_reports_ok_when_database_is_reachable() -> None:
-    # Uses the real database from DATABASE_URL.
-    with TestClient(app) as client:
-        response = client.get("/health")
+def test_health_reports_ok_when_database_is_reachable(client: TestClient) -> None:
+    # Uses the real (test) database configured in conftest.py.
+    response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "database": "ok"}

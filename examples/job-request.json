@@ -1,0 +1,10 @@
+{
+  "event_name": "Backend Development Workshop",
+  "issuer_name": "ABC Academy",
+  "issue_date": "2026-10-07",
+  "recipients": [
+    { "name": "Asha Sharma", "email": "asha@example.com" },
+    { "name": "Rohan Gupta", "email": "rohan@example.com" },
+    { "name": "", "email": "invalid-email" }
+  ]
+}

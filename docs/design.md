@@ -3,6 +3,9 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
+**Current state: Phase 2 complete.** Jobs can be submitted and are stored, but
+no certificates are generated yet (see [Current limitations](#current-limitations)).
+
 ## Stack
 
 | Component | Choice |
@@ -10,11 +13,12 @@ this file first if a decision changes.
 | Language | Python 3.12 |
 | API | FastAPI (sync route handlers, run in FastAPI's threadpool) |
 | Database | PostgreSQL 17 |
-| DB access | SQLAlchemy 2.0 (sync) with the psycopg 3 driver |
-| Migrations | Alembic |
+| DB access | SQLAlchemy 2.x (sync) with the psycopg 3 driver |
+| Migrations | Alembic (never `create_all()` at startup) |
 | Background processing | Celery, one task per job |
 | Broker | Redis |
 | PDF | ReportLab |
+| Email syntax | email-validator (syntax only, no DNS lookups) |
 | Tests | pytest, HTTPX (FastAPI `TestClient`), pypdf |
 | Local setup | Docker Compose |
 
@@ -27,11 +31,13 @@ database code. Each request and each worker execution owns its own session.
 2. API validates shared information (reject whole request with `422` if invalid).
 3. API validates each recipient independently, preserving its `input_index`.
 4. API saves the job and every recipient outcome in one transaction.
-5. After commit, API enqueues the job ID (only the ID) to Celery.
+5. After commit, API hands the job ID (only the ID) to `enqueue_job`.
 6. API returns `202 Accepted` with the job ID.
 7. Worker generates PDFs for valid recipients, one at a time.
 8. Worker records `SUCCESS` or `FAILED` per recipient.
 9. Client polls progress, reads per-recipient results, downloads PDFs.
+
+Steps 1–6 are implemented. Step 5 is a stub until Phase 5 (see limitations).
 
 **PostgreSQL is the source of truth for progress.** Clients never depend on
 Celery task state, so no Celery result backend is configured.
@@ -40,33 +46,106 @@ Celery task state, so no Celery result backend is configured.
 
 | Input | Rule |
 |---|---|
-| Event name | Required, trimmed, 1–200 characters |
-| Issuer name | Required, trimmed, 1–200 characters |
-| Issue date | Required, valid ISO date |
-| Recipients | Required list, 1–1,000 entries (application limit, configurable) |
+| Event name | Required string, trimmed, 1–200 characters |
+| Issuer name | Required string, trimmed, 1–200 characters |
+| Issue date | Required, ISO `YYYY-MM-DD` string that is a real calendar date |
+| Recipients | Required list, 1–1,000 entries (`MAX_RECIPIENTS_PER_JOB` in `app/schemas.py`) |
 | Recipient name | Required string, trimmed, 1–150 characters |
-| Recipient email | Optional; format validated when provided |
+| Recipient email | Optional or `null`; when a string is given, its syntax is validated |
 | Duplicate names or emails | Allowed; each entry processed independently |
-| Invalid shared information | `422`, no job created |
+| Invalid shared information | `422`, no records created |
 | Some invalid recipients | Job accepted; those entries stored as `INVALID` |
-| All recipients invalid | `422` with indexed errors; no job created |
+| All recipients invalid | `422` with indexed errors; no records created |
 
-Partial acceptance: the outer list is validated first (type and length), then
-`RecipientInput.model_validate()` is called separately for each entry and its
-errors are captured.
+How it is implemented:
+
+- **Two levels.** `JobCreateRequest` validates the shared fields and only the
+  outer recipients list (type and length). Its items are declared
+  `SkipValidation[RecipientInput]`, so entries stay as submitted and Swagger
+  still shows the recipient schema.
+- **Per entry.** `app/services/validation.py` calls
+  `RecipientInput.model_validate(entry)` for each entry separately and
+  catches its `ValidationError`. Malformed entries (`null`, strings, numbers,
+  lists, missing fields, wrong types) become `INVALID` without affecting
+  their siblings. `input_index` is the zero-based position in the submitted list.
+- **Strings** are trimmed before length checks, so whitespace-only values
+  fail as too short. Numbers are not coerced to strings.
+- **Issue date** must be a `YYYY-MM-DD` string; Pydantic alone would also accept
+  Unix timestamps and datetimes. `2026-02-30` is rejected.
+- **Email** is checked with `email-validator` (`check_deliverability=False`, so
+  no network access) and stored in normalized form (domain lowercased). An
+  empty or whitespace-only email string is invalid; omit it or send `null`.
+- **Unknown extra fields** are ignored, at both levels.
+- The 1,000 limit is an application choice, not part of the assignment.
+
+### Error formats
+
+Each recipient error is a plain JSON object:
+
+```json
+{ "field": "email", "code": "email_invalid", "message": "Invalid email address: ..." }
+```
+
+`field` is `null` when the whole entry is wrong (for example `null` or not an
+object; code `model_type`). `code` is Pydantic's error type or one of ours
+(`email_invalid`, `date_format`). The submitted value, exception objects, and
+Pydantic context are never stored.
+
+| Case | `422` body |
+|---|---|
+| Shared fields or recipients list invalid | FastAPI's standard `{"detail": [{"type", "loc", "msg", "input"}]}` |
+| Every recipient invalid | `{"detail": {"code": "all_recipients_invalid", "message", "recipient_errors": [{"input_index", "errors": [...]}]}}` |
 
 ## Database
 
-`generation_jobs`: `id` (UUID), `event_name`, `issuer_name`, `issue_date`,
-`status`, `total_count`, `error_code`, `error_message`, timestamps.
+Created by migration `f8fdd795353d` (`migrations/versions/`).
 
-`job_recipients`: `id` (UUID, also the certificate ID), `job_id` (FK),
-`input_index`, nullable validated `name` and `email`, `status`,
-validation/error details, nullable `storage_key`, timestamps.
+`generation_jobs`
 
-- Unique constraint on `(job_id, input_index)`.
-- Index on `(job_id, status)`.
-- Result counts are computed from recipient rows, not stored counters.
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | generated by the application |
+| `event_name`, `issuer_name` | varchar(200) | validated, trimmed |
+| `issue_date` | date | |
+| `status` | varchar(32) | CHECK: one of the job states |
+| `total_count` | integer | all submitted entries, valid or not; CHECK `>= 1` |
+| `error_code`, `error_message` | nullable | job-level failure only |
+| `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
+| `started_at`, `completed_at` | timestamptz, nullable | set by the worker (Phase 4/5) |
+
+`job_recipients`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | also the certificate ID for a `SUCCESS` row |
+| `job_id` | UUID FK → `generation_jobs.id` | `ON DELETE CASCADE` |
+| `input_index` | integer | zero-based; CHECK `>= 0` |
+| `name` | varchar(150), nullable | validated value; `NULL` for `INVALID` rows |
+| `email` | varchar(320), nullable | validated, normalized; `NULL` for `INVALID` rows |
+| `status` | varchar(32) | CHECK: one of the recipient states |
+| `error_details` | JSONB, nullable | list of error objects (see above) |
+| `storage_key` | varchar(255), nullable | PDF location, set in Phase 4 |
+| `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
+
+Constraints and indexes:
+
+- `uq_job_recipients_job_id_input_index` on `(job_id, input_index)`.
+- `ix_job_recipients_job_id_status` on `(job_id, status)`.
+- `ck_*_status_valid` on both tables: status values are enforced by the database.
+- `ck_job_recipients_name_matches_status`: `INVALID` rows store no name or
+  email; every other row has a name. Rejected values are never written to the
+  typed columns; an invalid entry is identified by `input_index` and explained
+  by `error_details`.
+- `ck_job_recipients_invalid_has_error_details`: `INVALID` rows always explain why.
+
+Status columns are VARCHAR + CHECK rather than native PostgreSQL ENUM types,
+so adding a state later is a constraint change, not an `ALTER TYPE`. The
+migration spells out the status values instead of importing them from
+`app.models`, so it keeps describing the schema as it was written.
+
+Result counts are computed from recipient rows, not stored counters.
+`updated_at` is maintained by SQLAlchemy (`onupdate`), so raw SQL updates must
+set it themselves.
 
 ### Recipient states
 
@@ -99,15 +178,42 @@ progress_percent = processed / total_count × 100
 succeeded. Infrastructure failures that end a job record an explicit job error
 and give unfinished entries a terminal failure outcome.
 
+## Job creation and transaction boundary
+
+`POST /api/v1/jobs` → `app/api/jobs.py` (thin route) →
+`app/services/jobs.submit_job`:
+
+1. `create_job` validates recipients. If none is valid it raises
+   `AllRecipientsInvalidError` before touching the database (route → `422`).
+2. It builds the job plus one row per submitted entry (`PENDING` or
+   `INVALID`) and commits them in **one transaction**. On any failure the
+   session is rolled back and the error re-raised (client gets `500`), leaving
+   no job and no recipient rows.
+3. Only after the commit, `submit_job` calls `dispatch.enqueue_job(job_id)`,
+   so dispatch never sees an uncommitted job.
+
 ## API contract
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/jobs` | Submit a batch |
-| `GET` | `/api/v1/jobs/{job_id}` | Status and aggregate progress |
-| `GET` | `/api/v1/jobs/{job_id}/recipients` | Paginated recipient results (`limit`, `offset`) |
-| `GET` | `/api/v1/certificates/{certificate_id}/download` | Download a successful PDF |
-| `GET` | `/health` | API running and database reachable |
+| Method | Endpoint | Purpose | Status |
+|---|---|---|---|
+| `POST` | `/api/v1/jobs` | Submit a batch | Implemented (Phase 2) |
+| `GET` | `/api/v1/jobs/{job_id}` | Status and aggregate progress | Phase 6 |
+| `GET` | `/api/v1/jobs/{job_id}/recipients` | Paginated recipient results (`limit`, `offset`) | Phase 6 |
+| `GET` | `/api/v1/certificates/{certificate_id}/download` | Download a successful PDF | Phase 6 |
+| `GET` | `/health` | API running and database reachable | Implemented (Phase 1) |
+
+`POST /api/v1/jobs` returns `202`:
+
+```json
+{
+  "job_id": "7e524b50-7651-49c0-a997-aedcaa1c434d",
+  "status": "QUEUED",
+  "total_count": 3,
+  "valid_count": 2,
+  "invalid_count": 1,
+  "status_url": "/api/v1/jobs/7e524b50-7651-49c0-a997-aedcaa1c434d"
+}
+```
 
 Download responses: `200` PDF; `404` unknown certificate ID; `409` not ready
 or generation did not succeed; documented `5xx` if a successful file is
@@ -120,10 +226,41 @@ PDFs are written to a directory shared by the API and worker containers
 metadata and a `storage_key`; file paths are derived from generated IDs, never
 from user input. Files are written to a temporary file and atomically renamed.
 
+## Testing
+
+- Tests run in the `tests` Compose service against a **dedicated test
+  database** named by `TEST_DATABASE_URL` (`certificates_test`). DATABASE_URL
+  is replaced with it before the app is imported, so the app under test
+  cannot reach the application database.
+- Each run drops and recreates the test database, then applies the real
+  migrations with the Alembic CLI. Each test starts with truncated tables.
+- Guards (`tests/database.py`): the test database name must end in `_test`
+  and must differ from the application database name. Every create, drop,
+  migrate, and truncate helper rechecks the name. Otherwise the run stops
+  with exit code 4 before touching any database.
+- Queue dispatch is replaced by a recorder in API tests. No PDF generation or
+  live queue processing yet.
+- Known warning: Starlette prints `StarletteDeprecationWarning: Using httpx
+  with starlette.testclient is deprecated; install httpx2 instead`. We keep
+  the locked, tested `httpx` (as decided) and do not suppress the warning.
+
+## Current limitations
+
+- **No background dispatch yet.** `enqueue_job` only logs a warning; nothing
+  is published to Redis. Jobs stay `QUEUED` and recipients stay `PENDING`
+  until Phases 4–5. Phase 5 replaces the body of `enqueue_job`.
+- `status_url` points at `GET /api/v1/jobs/{job_id}`, which returns `404`
+  until Phase 6.
+- Submitting the same request twice creates two jobs (no idempotency key).
+- Phase 5 must handle the gap between committing a job and publishing its
+  task (a crash in between leaves a `QUEUED` job that nobody processes).
+- Worker concurrency and Redis persistence are left for Phase 5.
+
 ## Implementation phases
 
-1. Project foundation: config, DB connection, Alembic, Docker, `/health`.
-2. Models, migration, recipient validation, `POST /api/v1/jobs`.
+1. Project foundation: config, DB connection, Alembic, Docker, `/health`. ✅
+2. Models, migration, recipient validation, `POST /api/v1/jobs`, isolated
+   test database (moved forward from Phase 7). ✅
 3. Standalone ReportLab certificate renderer.
 4. `process_job(job_id)` with per-recipient failure isolation.
 5. Celery and Redis integration with atomic job claim.
