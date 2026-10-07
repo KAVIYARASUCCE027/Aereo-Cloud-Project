@@ -1,7 +1,7 @@
 """Certificate generation for one job: process_job(job_id).
 
-Callable directly (tests, `python -m app.cli process-job JOB_ID`) and, from
-Phase 5, from a thin Celery task. It opens its own short database sessions and
+Called by the Celery task in app/worker.py, by tests, and by
+`python -m app.cli process-job JOB_ID`. It opens its own short database sessions and
 never keeps a transaction open while a PDF is rendered or written. Only plain
 values (UUIDs, strings, dates) cross transaction boundaries, never ORM
 objects, so no lazy load can silently start a new transaction.

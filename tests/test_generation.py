@@ -25,32 +25,14 @@ from sqlalchemy.exc import OperationalError
 
 from app.db import SessionLocal, engine
 from app.models import GenerationJob, JobRecipient, JobStatus, RecipientStatus
-from app.schemas import JobCreateRequest
-from app.services import generation, jobs, storage
+from app.services import generation, storage
 from app.services.generation import JobProcessingError, ProcessOutcome, claim_job, claim_statement, process_job
 from app.services.pdf import CertificateData, TextDoesNotFitError
 from app.services.progress import JobNotFoundError, JobProgress, get_job_progress
 
 real_render = generation.render_certificate
 
-CreateJob = Callable[..., uuid.UUID]
-
-
-@pytest.fixture
-def storage_root(tmp_path: Path) -> Path:
-    return tmp_path / "certificates"
-
-
-@pytest.fixture
-def create_job(job_payload: Callable[..., dict[str, Any]]) -> CreateJob:
-    """Create a job through the real submission service (validation + one transaction)."""
-
-    def create(recipients: list[Any], **overrides: Any) -> uuid.UUID:
-        request = JobCreateRequest.model_validate(job_payload(recipients, **overrides))
-        with SessionLocal() as session:
-            return jobs.create_job(session, request).job_id
-
-    return create
+CreateJob = Callable[..., uuid.UUID]  # the create_job fixture in conftest.py
 
 
 def load_job(job_id: uuid.UUID) -> GenerationJob:

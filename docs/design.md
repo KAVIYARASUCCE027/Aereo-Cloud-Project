@@ -3,9 +3,9 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 4 complete.** Jobs are submitted over HTTP and stored;
-`process_job(job_id)` generates their certificates, but it is started by a
-local command, not yet by a background worker (see
+**Current state: Phase 5 complete.** Jobs are submitted over HTTP, stored,
+and published to Redis; a separate Celery worker runs `process_job(job_id)`.
+Status, results, and download endpoints are Phase 6 (see
 [Current limitations](#current-limitations)).
 
 ## Stack
@@ -17,8 +17,8 @@ local command, not yet by a background worker (see
 | Database | PostgreSQL 17 |
 | DB access | SQLAlchemy 2.x (sync) with the psycopg 3 driver |
 | Migrations | Alembic (never `create_all()` at startup) |
-| Background processing | Celery, one task per job (Phase 5) |
-| Broker | Redis |
+| Background processing | Celery 5.6, one task per job, prefork worker |
+| Broker | Redis 7 with append-only persistence |
 | PDF | ReportLab, with bundled DejaVu fonts |
 | Email syntax | email-validator (syntax only, no DNS lookups) |
 | Tests | pytest, HTTPX (FastAPI `TestClient`), pypdf |
@@ -33,14 +33,15 @@ database code. Each request and each processing run owns its own sessions.
 2. API validates shared information (reject whole request with `422` if invalid).
 3. API validates each recipient independently, preserving its `input_index`.
 4. API saves the job and every recipient outcome in one transaction.
-5. After commit, API hands the job ID (only the ID) to `enqueue_job`.
-6. API returns `202 Accepted` with the job ID. The API never renders PDFs.
-7. `process_job(job_id)` generates PDFs for valid recipients, one at a time.
+5. After commit, API publishes one Celery task carrying only the job ID.
+6. API returns `202 Accepted` with the job ID (or `503` if publishing failed).
+   The API never renders PDFs.
+7. A worker runs `process_job(job_id)`: PDFs for valid recipients, one at a time.
 8. It records `SUCCESS` or `FAILED` per recipient and finalizes the job.
 9. Client polls progress, reads per-recipient results, downloads PDFs.
 
-Steps 1–8 are implemented. Step 5 is still a stub, so step 7 is started with
-`python -m app.cli process-job JOB_ID` until Phase 5. Step 9 is Phase 6.
+Steps 1–8 are implemented; step 9 is Phase 6. `python -m app.cli process-job
+JOB_ID` still runs step 7 by hand, without Celery.
 
 **PostgreSQL is the source of truth for progress.** Clients never depend on
 Celery task state, so no Celery result backend is configured.
@@ -142,16 +143,23 @@ exception objects, stack traces, and internal paths are never stored.
 | `unsupported_characters`, `text_does_not_fit`, `render_failed` | rendering (recipient `FAILED`) |
 | `storage_error` | saving the PDF failed (message names only the error kind, e.g. `ENOSPC`) |
 | `generation_error` | unexpected error while rendering (details only in logs) |
+| `dispatch_failed` | the job could not be published to the queue (job-level `error_code`, and each recipient left unprocessed) |
 
 | Case | `422` body |
 |---|---|
 | Shared fields or recipients list invalid | FastAPI's standard `{"detail": [{"type", "loc", "msg", "input"}]}` |
 | Every recipient invalid | `{"detail": {"code": "all_recipients_invalid", "message", "recipient_errors": [{"input_index", "errors": [...]}]}}` |
 
+| Case | `503` body |
+|---|---|
+| Job saved but could not be queued | `{"detail": {"code": "dispatch_failed", "message", "job_id", "job_status": "FAILED" or null, "status_url"}}` |
+
 ## Database
 
 Migrations (`migrations/versions/`): `f8fdd795353d` creates the tables;
-`da47b265b133` adds recipient processing timestamps and outcome rules.
+`da47b265b133` adds recipient processing timestamps and outcome rules;
+`56bdc5b0374c` lets a recipient be `FAILED` without having started (needed
+when its job could not be queued).
 
 `generation_jobs`
 
@@ -162,7 +170,7 @@ Migrations (`migrations/versions/`): `f8fdd795353d` creates the tables;
 | `issue_date` | date | |
 | `status` | varchar(32) | CHECK: one of the job states |
 | `total_count` | integer | all submitted entries, valid or not; CHECK `>= 1` |
-| `error_code`, `error_message` | nullable | job-level failure only (used from Phase 5) |
+| `error_code`, `error_message` | nullable | job-level failure only (`dispatch_failed`) |
 | `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
 | `started_at` | timestamptz, nullable | set when a processing run claims the job |
 | `completed_at` | timestamptz, nullable | set exactly when the job becomes terminal |
@@ -180,7 +188,7 @@ Migrations (`migrations/versions/`): `f8fdd795353d` creates the tables;
 | `error_details` | JSONB, nullable | list of error objects; Python `None` is stored as SQL `NULL` |
 | `storage_key` | varchar(255), nullable | `{id}.pdf`, set together with `SUCCESS` |
 | `created_at`, `updated_at` | timestamptz, not null | server default `now()` |
-| `started_at`, `completed_at` | timestamptz, nullable | processing times; both `NULL` for `INVALID` rows |
+| `started_at`, `completed_at` | timestamptz, nullable | processing times; both `NULL` for `INVALID` rows; `started_at` is `NULL` for a `FAILED` row that never started |
 
 Constraints and indexes:
 
@@ -192,8 +200,9 @@ Constraints and indexes:
 - `ck_job_recipients_invalid_has_error_details`, `..._failed_has_error_details`:
   `INVALID` and `FAILED` rows always explain why.
 - `ck_job_recipients_success_has_storage_key`: `SUCCESS` always names its file.
-- `ck_job_recipients_processed_has_started_at`,
-  `..._finished_has_completed_at`: processing timestamps match the status.
+- `ck_job_recipients_processing_or_success_has_started_at`,
+  `..._finished_has_completed_at`: processing timestamps match the status
+  (`SUCCESS` and `FAILED` always have `completed_at`).
 - `ck_generation_jobs_completed_at_matches_status`: `completed_at` is set if
   and only if the job is terminal; `..._processing_has_started_at`.
 
@@ -252,13 +261,14 @@ up to `total_count`; otherwise finalization is refused.
    session is rolled back and the error re-raised (client gets `500`), leaving
    no job and no recipient rows.
 3. Only after the commit, `submit_job` calls `dispatch.enqueue_job(job_id)`,
-   so dispatch never sees an uncommitted job.
+   so a worker never receives the ID of a job it cannot read. Publish
+   failures are handled as described under Dispatch.
 
 ## Processing (`process_job`)
 
 `app/services/generation.py`: `process_job(job_id, storage_root=None)`. It
 takes no request or task object, opens its own sessions, and is called by
-tests and by `python -m app.cli process-job`. Phase 5 wraps it in a Celery task.
+the Celery task, by tests, and by `python -m app.cli process-job`.
 
 | Step | Transaction | What happens |
 |---|---|---|
@@ -320,6 +330,104 @@ Prints the outcome and counts as JSON. Exit codes: `0` processed or nothing
 to do, `1` unknown job, `2` stopped by an infrastructure error.
 `--storage-dir DIR` overrides `CERTIFICATE_STORAGE_DIR`. It runs in the worker
 container so PDFs land in the shared certificate volume.
+
+## Dispatch and the worker
+
+`app/worker.py` defines the Celery app and one task, `certificates.process_job`,
+whose only argument is the job ID as a string. The task is a thin wrapper,
+`process_job(UUID(job_id))`, returning a small summary that Celery logs (there
+is no result backend). `app/services/dispatch.py` publishes it.
+
+**Delivery settings** (asserted by a test):
+
+| Setting | Value | Why |
+|---|---|---|
+| `task_acks_late` | `True` | acknowledge after the task returns, so a worker that dies before claiming the job does not lose the message |
+| `task_reject_on_worker_lost` | `True` | if a worker child process dies, requeue its message immediately |
+| `worker_prefetch_multiplier` | `1` | a busy process does not reserve further jobs |
+| `visibility_timeout` | 3600 s | Redis redelivers an unacknowledged message after this long |
+| retries | none | failed tasks are logged and acknowledged, never retried automatically |
+
+This is at-least-once delivery. It is safe only because `process_job` claims
+a job atomically: a second delivery of the same message returns
+`already_processing` or `already_finished` and changes nothing (tested).
+Celery does not provide exactly-once execution, and none is assumed.
+
+Each prefork child disposes the inherited SQLAlchemy pool on start
+(`worker_process_init`), so it never shares a connection with its parent.
+Concurrency is `WORKER_CONCURRENCY` (default 2): that many jobs run in
+parallel, each processing its recipients sequentially. Redis runs with an
+append-only file on a volume, so queued messages survive a Redis restart.
+
+### Publish failures
+
+`enqueue_job` retries the publish once (enough to replace a pooled connection
+that went stale when Redis restarted), then raises `DispatchError`.
+`submit_job` then calls `record_dispatch_failure` in the request's session:
+
+- One conditional `UPDATE generation_jobs ... WHERE id = :id AND status = 'QUEUED'`
+  sets `FAILED`, `error_code = 'dispatch_failed'`, `error_message`, and
+  `completed_at`. The same transaction marks every `PENDING` recipient
+  `FAILED` with `dispatch_failed` (`started_at` stays `NULL`); `INVALID`
+  entries keep their own errors. Progress is then 100%: every entry has a
+  final outcome. The client gets `503 dispatch_failed` with `job_status: FAILED`.
+- **A worker's claim is never overwritten.** The publish may have reached
+  Redis even though the client saw an error (for example a lost reply). The
+  failure update and the worker's claim are both conditional on
+  `status = 'QUEUED'` on the same row, so PostgreSQL's row lock lets exactly
+  one win. If the worker won, nothing is changed and the client gets `202`
+  with the job's current status. If the failure was recorded first, a late
+  message finds the job `FAILED` and does nothing.
+- If the failure itself cannot be saved (database error), the job stays
+  `QUEUED` with no message; the client gets `503` with `job_status: null`,
+  and the error is logged.
+
+Measured in Docker Compose (Phase 5 demo): after a Redis restart, submissions
+still returned `202` (the retry reconnects). With the `redis` container
+stopped, `503` arrived after 16 s and then 8 s, because each lookup of the
+stopped container's host name takes 4–8 s in Docker's DNS. A refused
+connection fails in under a second. Once Redis was back, the next submission
+got `202` in 0.03 s.
+
+### Crash windows (not handled)
+
+- **Commit, then crash before publish.** The job stays `QUEUED` with no
+  message, and nothing re-publishes it. Future work: a transactional outbox
+  (write the message in the job's transaction, publish from that table) or a
+  sweeper that re-publishes old `QUEUED` jobs. The atomic claim makes
+  re-publishing safe.
+- **Publish succeeded, response lost.** The job is processed, but the client
+  saw an error and may submit again, creating a second job (no idempotency key).
+- **Redis loses data.** With `appendfsync everysec`, up to about one second
+  of queued messages can be lost if Redis crashes; those jobs stay `QUEUED`.
+
+### Worker interruption: observed behaviour
+
+Measured with 1,000-recipient jobs (about 30 s of processing, roughly 30 ms
+per certificate):
+
+- **Graceful stop** (`docker compose stop worker`, SIGTERM): Celery's warm
+  shutdown let the running job finish (the stop took 26 s; job `COMPLETED`,
+  1,000 `SUCCESS`), then the worker exited. `stop_grace_period` is 2 minutes;
+  a job still running after that is killed, as below.
+- **Crash** (`docker compose kill -s SIGKILL worker` after about 250
+  certificates): the job stayed `PROCESSING` with 258 `SUCCESS`, 1 `PROCESSING`,
+  and 741 `PENDING`. Redis kept the message unacknowledged. After restarting
+  the worker nothing changed, and a manual `process-job` returned
+  `already_processing`. The message is redelivered after the visibility
+  timeout (1 hour; not waited for in the demo) and then does nothing, for the
+  same reason. **There is no recovery of interrupted jobs.** Certificates
+  already produced remain valid and recorded.
+- **Crash between receiving the message and the claim:** the unacknowledged
+  message is redelivered (immediately if only a child process died, otherwise
+  after the visibility timeout) and the job is processed then. Not
+  demonstrated; it follows from `acks_late`.
+
+Recovering interrupted jobs needs a rule defined first, for example: a job
+`PROCESSING` without progress for N minutes is reclaimed, its `PROCESSING`
+recipient is reset to `PENDING` (its file name is stable, so regenerating it
+overwrites the same file), and processing resumes with the `PENDING` rows.
+Automatic retries should only be added together with such a rule.
 
 ## API contract
 
@@ -410,7 +518,16 @@ database stores only metadata and a `storage_key`.
   and must differ from the application database name. Every create, drop,
   migrate, and truncate helper rechecks the name. Otherwise the run stops
   with exit code 4 before touching any database.
-- Queue dispatch is replaced by a recorder in API tests. No live queue yet.
+- The test process uses Celery's in-memory transport: `CELERY_BROKER_URL` is
+  set to `memory://` before the app is imported (Celery reads that variable
+  ahead of its own configuration), so tests never reach the real Redis.
+  `tests/test_dispatch.py` reads back the real published message (task name
+  and `[job_id]` only), executes it through the registered task, checks
+  redelivery for finished and claimed jobs, and simulates broker outages by
+  replacing the task object with one that raises kombu's `OperationalError`.
+  Most API tests replace `enqueue_job` with a recorder.
+- Not yet automated: a real Redis + worker round trip. It was checked by
+  hand in the Phase 5 demo and is the Phase 7 integration test.
 - PDF tests render real PDFs and read them back with pypdf.
 - Processing tests (`tests/test_generation.py`) use the real renderer and
   storage in a temporary directory. Failures are injected with `monkeypatch`
@@ -427,13 +544,15 @@ database stores only metadata and a `storage_key`.
 
 ## Current limitations
 
-- **No background dispatch yet.** `enqueue_job` only logs a warning; nothing
-  is published to Redis. Jobs stay `QUEUED` until someone runs
-  `python -m app.cli process-job`. Phase 5 replaces the body of `enqueue_job`.
-- **No crash recovery.** If a run dies or hits a database error, the job stays
-  `PROCESSING` (and possibly one recipient too). `process_job` will not touch
-  it again (`already_processing`), and nothing detects abandoned jobs or marks
-  their unfinished entries as failed. Deferred.
+- **No crash recovery.** If a worker dies mid-job or hits a database error,
+  the job stays `PROCESSING` (and possibly one recipient too). Redelivered
+  messages and manual runs return `already_processing`; nothing detects
+  abandoned jobs or marks their unfinished entries as failed. Deferred.
+- **Commit-to-publish window** and lost Redis writes can leave `QUEUED` jobs
+  that no message will process; there is no outbox or sweeper.
+- While the broker is unreachable, a submission waits for the publish to fail
+  (8–16 s measured with a stopped Redis container) before the `503`, holding
+  an API worker thread meanwhile.
 - **Unreferenced files** can remain after a database failure that follows a
   successful save, and abandoned temporary files after a killed write. No
   cleanup exists.
@@ -443,9 +562,6 @@ database stores only metadata and a `storage_key`.
 - `status_url` points at `GET /api/v1/jobs/{job_id}`, which returns `404`
   until Phase 6.
 - Submitting the same request twice creates two jobs (no idempotency key).
-- Phase 5 must handle the gap between committing a job and publishing its
-  task (a crash in between leaves a `QUEUED` job that nobody processes).
-- Worker concurrency and Redis persistence are left for Phase 5.
 
 ## Implementation phases
 
@@ -455,7 +571,8 @@ database stores only metadata and a `storage_key`.
 3. Standalone ReportLab certificate renderer and atomic storage. ✅
 4. `process_job(job_id)` with per-recipient failure isolation, shared text
    policy at submission, manual processing command. ✅
-5. Celery and Redis integration with atomic job claim.
+5. Celery and Redis integration: one task per job, publish-failure handling,
+   delivery settings, Redis persistence, measured interruption behaviour. ✅
 6. Job status, recipient results, downloads.
 7. Complete automated tests, including real Redis + Celery integration.
 8. README, examples, final verification.

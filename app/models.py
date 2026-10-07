@@ -143,9 +143,11 @@ class JobRecipient(Base):
         # SUCCESS means the PDF was saved; FAILED always explains why.
         CheckConstraint("status <> 'SUCCESS' OR storage_key IS NOT NULL", name="success_has_storage_key"),
         CheckConstraint("status <> 'FAILED' OR error_details IS NOT NULL", name="failed_has_error_details"),
+        # FAILED does not require started_at: a recipient can fail without ever
+        # starting, e.g. when its job could not be queued.
         CheckConstraint(
-            "status NOT IN ('PROCESSING', 'SUCCESS', 'FAILED') OR started_at IS NOT NULL",
-            name="processed_has_started_at",
+            "status NOT IN ('PROCESSING', 'SUCCESS') OR started_at IS NOT NULL",
+            name="processing_or_success_has_started_at",
         ),
         CheckConstraint(
             "status NOT IN ('SUCCESS', 'FAILED') OR completed_at IS NOT NULL",

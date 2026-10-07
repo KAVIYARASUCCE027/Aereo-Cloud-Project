@@ -117,7 +117,7 @@ def test_database_requires_error_details_for_failed() -> None:
 
 
 def test_database_requires_timestamps_for_processed_recipients() -> None:
-    with pytest.raises(IntegrityError, match="ck_job_recipients_processed_has_started_at"), engine.begin() as connection:
+    with pytest.raises(IntegrityError, match="ck_job_recipients_processing_or_success_has_started_at"), engine.begin() as connection:
         insert_recipient(connection, insert_job(connection), status="PROCESSING")
 
 

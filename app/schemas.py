@@ -165,3 +165,16 @@ class AllRecipientsInvalidDetail(BaseModel):
 
 class AllRecipientsInvalidResponse(BaseModel):
     detail: AllRecipientsInvalidDetail
+
+
+class DispatchFailedDetail(BaseModel):
+    code: Literal["dispatch_failed"] = "dispatch_failed"
+    message: str
+    job_id: uuid.UUID
+    # FAILED once the failure was recorded; null if even that could not be saved.
+    job_status: JobStatus | None
+    status_url: str
+
+
+class DispatchFailedResponse(BaseModel):
+    detail: DispatchFailedDetail
