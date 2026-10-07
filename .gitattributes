@@ -1,0 +1,5 @@
+# Keep LF endings in the repository and working tree; files run inside Linux containers.
+* text=auto eol=lf
+*.pdf binary
+*.ttf binary
+*.png binary

@@ -1,0 +1,1 @@
+Alembic migrations. The database URL comes from DATABASE_URL (see app/config.py).

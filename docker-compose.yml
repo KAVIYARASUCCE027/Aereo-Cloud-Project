@@ -1,0 +1,95 @@
+# Every variable has a default, so `docker compose up --build` works without a .env file.
+
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-certificates}:${POSTGRES_PASSWORD:-certificates}@db:5432/${POSTGRES_DB:-certificates}
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CERTIFICATE_STORAGE_DIR: /data/certificates
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-certificates}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-certificates}
+      POSTGRES_DB: ${POSTGRES_DB:-certificates}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Runs once and exits. API and worker start only after it succeeds,
+  # so two containers never race to apply migrations.
+  migrate:
+    build:
+      context: .
+      target: runtime
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-environment
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: *app-environment
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - certificates:/data/certificates
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    command: ["celery", "-A", "app.worker:celery_app", "worker", "--loglevel=INFO"]
+    environment: *app-environment
+    volumes:
+      - certificates:/data/certificates
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Not started by `up`. Run with: docker compose run --rm --build tests
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: dev
+    command: ["pytest", "-v"]
+    environment: *app-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  certificates:

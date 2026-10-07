@@ -1,0 +1,8 @@
+# Direct runtime dependencies. requirements.txt is the locked, generated file.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic-settings>=2.4,<3
+sqlalchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+alembic>=1.13
+celery[redis]>=5.4,<6
