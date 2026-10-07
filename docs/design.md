@@ -3,8 +3,10 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 2 complete.** Jobs can be submitted and are stored, but
-no certificates are generated yet (see [Current limitations](#current-limitations)).
+**Current state: Phase 3 complete.** Jobs can be submitted and are stored,
+and a standalone renderer can produce certificate PDFs, but the two are not
+connected yet: no certificates are generated for submitted jobs (see
+[Current limitations](#current-limitations)).
 
 ## Stack
 
@@ -17,7 +19,7 @@ no certificates are generated yet (see [Current limitations](#current-limitation
 | Migrations | Alembic (never `create_all()` at startup) |
 | Background processing | Celery, one task per job |
 | Broker | Redis |
-| PDF | ReportLab |
+| PDF | ReportLab, with bundled DejaVu fonts |
 | Email syntax | email-validator (syntax only, no DNS lookups) |
 | Tests | pytest, HTTPX (FastAPI `TestClient`), pypdf |
 | Local setup | Docker Compose |
@@ -219,12 +221,80 @@ Download responses: `200` PDF; `404` unknown certificate ID; `409` not ready
 or generation did not succeed; documented `5xx` if a successful file is
 unexpectedly missing.
 
+## Certificate rendering
+
+`app/services/pdf.py`: `render_certificate(CertificateData) -> bytes`. It is a
+pure function of its input: no FastAPI, Celery, database, or file writes
+(a test enforces that importing it loads none of those modules).
+
+**Template.** One fixed A4 landscape page: double border, title
+"CERTIFICATE / OF PARTICIPATION", "This is to certify that", recipient name,
+"has participated in", event name, issuer ("Issued by") and issue date
+("Date of issue", formatted like `7 October 2026` without using the system
+locale), and the certificate ID in the footer. PDF metadata: title, author
+(issuer), subject (event).
+
+**Long text.** Each variable text has a fixed area (`FIELD_SPECS`). The
+renderer wraps the text on spaces and lowers the font size in 0.5 pt steps
+until every line fits the area's width and all lines fit its height (name
+34→12 pt, event 22→8 pt, issuer 16→7 pt). A word wider than a line is broken
+between characters. Line height uses the fonts' real ascent and descent
+(0.94 / 0.24 em), so accented capitals stay inside their area. If text still
+does not fit, `TextDoesNotFitError` is raised; text is never drawn clipped.
+Tests show the longest values validation accepts (150-character name,
+200-character event and issuer) fit even when made entirely of the widest
+supported glyph.
+
+**Fonts.** DejaVu Serif, Serif Bold, and Sans 2.37 are bundled in
+`app/assets/fonts/` (Bitstream Vera license, redistributable; see the
+README and LICENSE there). ReportLab embeds only the used glyphs, and every
+font in the PDF is embedded, so output does not depend on the viewer's fonts.
+
+**Supported characters.** Text is NFC-normalized (so `e` + combining accent
+becomes `é`), then every character must be in one of these ranges *and* in the
+font:
+
+| Range | Examples |
+|---|---|
+| Basic Latin (printable, U+0020–007E) | `A-Z a-z 0-9 & - ' .` |
+| Latin-1 Supplement (U+00A0–00FF) | `é ü ñ ç å ø ß « »` |
+| Latin Extended-A and -B (U+0100–024F) | `ł ż ő č ş ș ț` |
+| Latin Extended Additional (U+1E00–1EFF) | Vietnamese `ễ ị ừ` |
+| Greek and Coptic (U+0370–03FF) | `Αλέξανδρος` |
+| Cyrillic (U+0400–04FF) | `Дмитрий` |
+| Punctuation (U+2010–2027) | `– — ‘ ’ “ ” • …` |
+
+Everything else raises `UnsupportedCharactersError` (`code =
+"unsupported_characters"`, message lists the code points), instead of
+producing a certificate with missing glyphs. That includes scripts that need
+glyph shaping or right-to-left layout, which ReportLab does not do (Devanagari,
+Arabic, Hebrew, Thai), CJK, emoji, and control or invisible characters
+(newline, tab, zero-width space).
+
+Note: validation (Phase 2) accepts any Unicode name. A name with unsupported
+characters is therefore accepted as `PENDING` and will fail at render time;
+Phase 4 records that as a `FAILED` recipient with the renderer's error code.
+
+Render errors share a base class `CertificateRenderError` with a stable
+`code` (`render_failed`, `unsupported_characters`, `text_does_not_fit`) and
+the `field` that caused it, ready to be stored in `error_details`.
+
 ## Storage
 
-PDFs are written to a directory shared by the API and worker containers
-(`CERTIFICATE_STORAGE_DIR`, a named Docker volume). The database stores only
-metadata and a `storage_key`; file paths are derived from generated IDs, never
-from user input. Files are written to a temporary file and atomically renamed.
+`app/services/storage.py`. PDFs are written to a directory shared by the API
+and worker containers (`CERTIFICATE_STORAGE_DIR`, a named Docker volume). The
+database stores only metadata and a `storage_key`.
+
+- **Key:** `{certificate_id}.pdf`, built from the generated recipient ID,
+  never from user input. `resolve_storage_path` refuses any key that would
+  resolve outside the storage root.
+- **Atomic write:** bytes go to a hidden temporary file in the target's own
+  directory (same filesystem), are flushed and `fsync`ed, then `os.replace`
+  swaps it into place, and the directory is `fsync`ed (POSIX). Readers see the
+  old file, the complete new file, or no file; never a partial PDF. On error
+  the temporary file is removed and any previous file is left untouched.
+- **Not handled:** if the process is killed mid-write, a `.<key>.*.tmp` file
+  can remain. It is never served (not a valid key) but is not cleaned up yet.
 
 ## Testing
 
@@ -238,8 +308,14 @@ from user input. Files are written to a temporary file and atomically renamed.
   and must differ from the application database name. Every create, drop,
   migrate, and truncate helper rechecks the name. Otherwise the run stops
   with exit code 4 before touching any database.
-- Queue dispatch is replaced by a recorder in API tests. No PDF generation or
-  live queue processing yet.
+- Queue dispatch is replaced by a recorder in API tests. No live queue
+  processing yet.
+- PDF tests render real PDFs and read them back with pypdf: page count and
+  size, every expected string, accented / Greek / Cyrillic names, NFC
+  normalization, worst-case long text, unsupported characters, embedded fonts,
+  and that character spacing cannot leak into later text.
+- Sample certificates for manual review are in `examples/sample-certificates/`
+  (regenerate with `python -m scripts.render_sample_certificates DIR`).
 - Known warning: Starlette prints `StarletteDeprecationWarning: Using httpx
   with starlette.testclient is deprecated; install httpx2 instead`. We keep
   the locked, tested `httpx` (as decided) and do not suppress the warning.
@@ -249,6 +325,10 @@ from user input. Files are written to a temporary file and atomically renamed.
 - **No background dispatch yet.** `enqueue_job` only logs a warning; nothing
   is published to Redis. Jobs stay `QUEUED` and recipients stay `PENDING`
   until Phases 4–5. Phase 5 replaces the body of `enqueue_job`.
+- **Renderer not connected yet.** Nothing calls `render_certificate` for a
+  job until Phase 4 (`process_job`).
+- Names with unsupported characters pass validation and will only fail at
+  render time (see Certificate rendering).
 - `status_url` points at `GET /api/v1/jobs/{job_id}`, which returns `404`
   until Phase 6.
 - Submitting the same request twice creates two jobs (no idempotency key).
@@ -261,7 +341,7 @@ from user input. Files are written to a temporary file and atomically renamed.
 1. Project foundation: config, DB connection, Alembic, Docker, `/health`. ✅
 2. Models, migration, recipient validation, `POST /api/v1/jobs`, isolated
    test database (moved forward from Phase 7). ✅
-3. Standalone ReportLab certificate renderer.
+3. Standalone ReportLab certificate renderer and atomic storage. ✅
 4. `process_job(job_id)` with per-recipient failure isolation.
 5. Celery and Redis integration with atomic job claim.
 6. Job status, recipient results, downloads.
