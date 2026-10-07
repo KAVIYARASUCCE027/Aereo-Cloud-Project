@@ -1,0 +1,8 @@
+{
+  "event_name": "",
+  "issuer_name": "ABC Academy",
+  "issue_date": "07/10/2026",
+  "recipients": [
+    { "name": "Asha Sharma" }
+  ]
+}

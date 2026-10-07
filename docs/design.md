@@ -3,7 +3,7 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 7 complete.** Jobs are submitted over HTTP, stored,
+**Current state: all eight phases complete.** Jobs are submitted over HTTP, stored,
 and published to Redis; a separate Celery worker runs `process_job(job_id)`;
 clients poll status, page through recipient results, and download PDFs (see
 [Current limitations](#current-limitations)).
@@ -637,4 +637,15 @@ database stores only metadata and a `storage_key`.
    certificate downloads with documented error responses. ✅
 7. Complete automated tests, including real Redis + Celery integration and
    checklist coverage. ✅
-8. README, examples, final verification.
+8. README, sample requests, curl demo, benchmark, verification from a clean
+   clone. ✅
+
+## Measured performance
+
+Single runs on the development machine (Docker Desktop on Windows, worker
+concurrency 2), not throughput guarantees:
+
+| Batch | `202` after | Worker processing (`started_at` to `completed_at`) | Per certificate | Outcome |
+|---|---|---|---|---|
+| 100 recipients (`scripts/benchmark.py`) | 0.25 s | 3.63 s | 36 ms | 100 `SUCCESS` |
+| 1,000 recipients (Phase 5 demo) | – | 29.9 s | 30 ms | 1,000 `SUCCESS` |
