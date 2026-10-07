@@ -3,9 +3,9 @@
 This file records the agreed decisions. Implementation must follow it; change
 this file first if a decision changes.
 
-**Current state: Phase 5 complete.** Jobs are submitted over HTTP, stored,
-and published to Redis; a separate Celery worker runs `process_job(job_id)`.
-Status, results, and download endpoints are Phase 6 (see
+**Current state: Phase 6 complete.** Jobs are submitted over HTTP, stored,
+and published to Redis; a separate Celery worker runs `process_job(job_id)`;
+clients poll status, page through recipient results, and download PDFs (see
 [Current limitations](#current-limitations)).
 
 ## Stack
@@ -40,8 +40,8 @@ database code. Each request and each processing run owns its own sessions.
 8. It records `SUCCESS` or `FAILED` per recipient and finalizes the job.
 9. Client polls progress, reads per-recipient results, downloads PDFs.
 
-Steps 1–8 are implemented; step 9 is Phase 6. `python -m app.cli process-job
-JOB_ID` still runs step 7 by hand, without Celery.
+All steps are implemented. `python -m app.cli process-job JOB_ID` can also
+run step 7 by hand, without Celery.
 
 **PostgreSQL is the source of truth for progress.** Clients never depend on
 Celery task state, so no Celery result backend is configured.
@@ -431,13 +431,18 @@ Automatic retries should only be added together with such a rule.
 
 ## API contract
 
-| Method | Endpoint | Purpose | Status |
+| Method | Endpoint | Purpose | Responses |
 |---|---|---|---|
-| `POST` | `/api/v1/jobs` | Submit a batch | Implemented (Phase 2) |
-| `GET` | `/api/v1/jobs/{job_id}` | Status and aggregate progress | Phase 6 |
-| `GET` | `/api/v1/jobs/{job_id}/recipients` | Paginated recipient results (`limit`, `offset`) | Phase 6 |
-| `GET` | `/api/v1/certificates/{certificate_id}/download` | Download a successful PDF | Phase 6 |
-| `GET` | `/health` | API running and database reachable | Implemented (Phase 1) |
+| `POST` | `/api/v1/jobs` | Submit a batch | `202`, `422`, `503` |
+| `GET` | `/api/v1/jobs/{job_id}` | Status and aggregate progress | `200`, `404`, `422` (malformed ID) |
+| `GET` | `/api/v1/jobs/{job_id}/recipients` | Paginated recipient results (`limit` 1–200, default 50; `offset` ≥ 0) | `200`, `404`, `422` |
+| `GET` | `/api/v1/certificates/{certificate_id}/download` | Download a successful PDF | `200`, `404`, `409`, `500` |
+| `GET` | `/health` | API running and database reachable | `200`, `503` |
+
+Routes are thin (`app/api/`); reads live in `app/services/progress.py`
+(`load_job_summary`) and `app/services/results.py`. URL paths in responses
+come from `app/api/urls.py`. Error bodies are `{"detail": {"code", "message", ...}}`
+except FastAPI's own `422` validation errors.
 
 `POST /api/v1/jobs` returns `202`:
 
@@ -452,9 +457,37 @@ Automatic retries should only be added together with such a rule.
 }
 ```
 
-Download responses: `200` PDF; `404` unknown certificate ID; `409` not ready
-or generation did not succeed; documented `5xx` if a successful file is
-unexpectedly missing.
+`GET /api/v1/jobs/{job_id}`: the job's fields plus `pending_count`,
+`processing_count`, `success_count`, `invalid_count`, `failed_count`,
+`processed_count`, `progress_percent` (2 decimals), `error_code`,
+`error_message`, timestamps, and `recipients_url`. The job row and all counts
+are read by **one SQL statement** (`count(*) FILTER (WHERE status = ...)`
+grouped by the job), so they come from one database snapshot and always add up
+to `total_count`, even while a worker is updating rows.
+
+`GET /api/v1/jobs/{job_id}/recipients`: `{"job_id", "total", "limit",
+"offset", "items": [...]}` in `input_index` order. Each item has
+`recipient_id` (the certificate ID), `input_index`, `status`, `name` and
+`email` (null for `INVALID`), `errors` (for `INVALID`/`FAILED`),
+`download_url` (only for `SUCCESS`), `started_at`, `completed_at`. An offset
+past the end returns an empty `items` list. Pages are read with
+`LIMIT/OFFSET`; between page requests a running job may change statuses, but
+the order (`input_index`) is stable.
+
+`GET /api/v1/certificates/{certificate_id}/download`:
+
+| Status | Code | When |
+|---|---|---|
+| `200` | | `SUCCESS`: `application/pdf`, `Content-Disposition: attachment; filename="certificate-{id}.pdf"` |
+| `404` | `certificate_not_found` | no recipient with this ID |
+| `409` | `certificate_not_ready` | `PENDING` or `PROCESSING` (body includes `status`) |
+| `409` | `certificate_not_available` | `INVALID` or `FAILED`; there will be no PDF |
+| `500` | `certificate_file_missing` | row is `SUCCESS` but the file cannot be read, or its key resolves outside storage (logged; no path in the response) |
+
+Availability is decided by the database row, never by the file's existence,
+so a file left behind after a database failure is not served. The file path
+comes from the stored key, confined to `CERTIFICATE_STORAGE_DIR`. The file
+is read into memory (about 65 KB) before responding.
 
 ## Certificate rendering
 
@@ -559,8 +592,8 @@ database stores only metadata and a `storage_key`.
 - **Character coverage** is limited to the scripts listed in the text policy.
 - Recipients are processed sequentially; the pending ID list for a job is read
   into memory at once (fine for 1,000 recipients).
-- `status_url` points at `GET /api/v1/jobs/{job_id}`, which returns `404`
-  until Phase 6.
+- No authentication or authorization: anyone who can reach the API can read
+  any job and download any certificate whose ID they know (IDs are random UUIDs).
 - Submitting the same request twice creates two jobs (no idempotency key).
 
 ## Implementation phases
@@ -573,6 +606,7 @@ database stores only metadata and a `storage_key`.
    policy at submission, manual processing command. ✅
 5. Celery and Redis integration: one task per job, publish-failure handling,
    delivery settings, Redis persistence, measured interruption behaviour. ✅
-6. Job status, recipient results, downloads.
+6. Job status (one-snapshot counts), paginated recipient results,
+   certificate downloads with documented error responses. ✅
 7. Complete automated tests, including real Redis + Celery integration.
 8. README, examples, final verification.

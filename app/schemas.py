@@ -20,7 +20,7 @@ from pydantic import (
 from pydantic_core import PydanticCustomError
 
 from app import text_policy
-from app.models import JobStatus
+from app.models import JobStatus, RecipientStatus
 
 # Application limit for one submission (not a requirement of the assignment).
 MAX_RECIPIENTS_PER_JOB = 1000
@@ -178,3 +178,72 @@ class DispatchFailedDetail(BaseModel):
 
 class DispatchFailedResponse(BaseModel):
     detail: DispatchFailedDetail
+
+
+class JobStatusResponse(BaseModel):
+    job_id: uuid.UUID
+    status: JobStatus
+    event_name: str
+    issuer_name: str
+    issue_date: date
+    total_count: int
+    pending_count: int
+    processing_count: int
+    success_count: int
+    invalid_count: int
+    failed_count: int
+    # success + invalid + failed: entries with a final outcome.
+    processed_count: int
+    # processed / total * 100, rounded to 2 decimals. 100 means every entry has
+    # a final outcome, not that every certificate succeeded.
+    progress_percent: float
+    # Set only when the job as a whole failed (e.g. dispatch_failed).
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    recipients_url: str
+
+
+class RecipientResult(BaseModel):
+    # Also the certificate ID of a SUCCESS entry.
+    recipient_id: uuid.UUID
+    input_index: int
+    status: RecipientStatus
+    # Validated values; null for INVALID entries.
+    name: str | None
+    email: str | None
+    # For INVALID and FAILED entries.
+    errors: list[FieldError] | None
+    # Only for SUCCESS entries.
+    download_url: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+class RecipientPageResponse(BaseModel):
+    job_id: uuid.UUID
+    total: int
+    limit: int
+    offset: int
+    items: list[RecipientResult]
+
+
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    detail: ErrorDetail
+
+
+class CertificateNotAvailableDetail(BaseModel):
+    code: Literal["certificate_not_ready", "certificate_not_available"]
+    message: str
+    status: RecipientStatus
+
+
+class CertificateNotAvailableResponse(BaseModel):
+    detail: CertificateNotAvailableDetail

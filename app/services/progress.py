@@ -3,10 +3,12 @@
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
-from app.models import GenerationJob, JobRecipient, JobStatus
+from app.models import GenerationJob, JobRecipient, JobStatus, RecipientStatus
+
+COUNT_FIELDS = {status: f"{status.value.lower()}_count" for status in RecipientStatus}
 
 
 class JobNotFoundError(LookupError):
@@ -39,18 +41,36 @@ class JobProgress:
         return self.processed_count / self.total_count * 100
 
 
-def get_job_progress(session: Session, job_id: uuid.UUID) -> JobProgress:
-    total_count = session.scalar(select(GenerationJob.total_count).where(GenerationJob.id == job_id))
-    if total_count is None:
-        raise JobNotFoundError(job_id)
+def load_job_summary(session: Session, job_id: uuid.UUID) -> tuple[GenerationJob, JobProgress]:
+    """The job row and its recipient counts, read by one SQL statement.
 
-    rows = session.execute(
-        select(JobRecipient.status, func.count())
-        .where(JobRecipient.job_id == job_id)
-        .group_by(JobRecipient.status)
+    One statement sees one snapshot of the database, so the job's status and
+    the counts always agree with each other, even while a worker is updating
+    rows (separate queries could each see a different moment).
+    """
+    row = session.execute(_summary_statement(job_id)).one_or_none()
+    if row is None:
+        raise JobNotFoundError(job_id)
+    job = row[0]
+    counts = {name: row._mapping[name] for name in COUNT_FIELDS.values()}
+    return job, JobProgress(total_count=job.total_count, **counts)
+
+
+def get_job_progress(session: Session, job_id: uuid.UUID) -> JobProgress:
+    return load_job_summary(session, job_id)[1]
+
+
+def _summary_statement(job_id: uuid.UUID) -> Select:
+    counts = [
+        func.count(JobRecipient.id).filter(JobRecipient.status == status).label(name)
+        for status, name in COUNT_FIELDS.items()
+    ]
+    return (
+        select(GenerationJob, *counts)
+        .outerjoin(JobRecipient, JobRecipient.job_id == GenerationJob.id)
+        .where(GenerationJob.id == job_id)
+        .group_by(GenerationJob.id)
     )
-    counts = {f"{status.value.lower()}_count": count for status, count in rows}
-    return JobProgress(total_count=total_count, **counts)
 
 
 def final_job_status(progress: JobProgress) -> JobStatus:
